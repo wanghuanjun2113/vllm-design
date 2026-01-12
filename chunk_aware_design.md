@@ -20,7 +20,7 @@ sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " us
 
 **位置编码约束**:
 - 每个chunk的位置编码都从sys_prompt之后重新开始（共享相同的位置范围）
-- user question的位置编码从sys_prompt + 单个chunk长度之后开始
+- user question的位置编码从sys_prompt + 单个最大chunk长度之后开始
 - 采用相对位置编码
 
 **用户澄清**:
@@ -140,7 +140,7 @@ sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " us
 #   chunk1:     [10,11,12,13,14,15,16,17,18,19]  # 从10开始
 #   chunk2:     [10,11,12,13,14,15,16,17,18,19]  # 相同范围！
 #   chunk3:     [10,11,12,13,14,15,16,17,18,19]  # 相同范围！
-#   question:   [20,21,22,23,24,25,26,27,28]     # 接着chunk范围
+#   question:   [20,21,22,23,24,25,26,27,28]     # 从sys_prompt_end + max_chunk_len之后开始
 ```
 
 #### 4.1.3 实现文件
