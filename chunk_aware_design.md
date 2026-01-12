@@ -14,7 +14,7 @@ sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " us
 
 **注意力约束**:
 - ✅ 每个chunk的token可以关注sys_prompt的token
-- ❌ chunk内的token之间**不能相互关注**
+- ✅ chunk内的token之间**可以相互关注** (causal attention，仅限同chunk内的前序token)
 - ❌ chunk之间**不能相互关注**
 - ✅ user question的token可以关注所有内容（sys_prompt + 所有chunks）
 
@@ -25,7 +25,7 @@ sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " us
 
 **用户澄清**:
 - chunk之间**无重叠**（独立文档）
-- chunk内的token**只能关注sys_prompt**（不能关注彼此）
+- chunk内的token**可以关注sys_prompt和同chunk内的前序token**（causal attention，但不能关注其他chunk）
 - 位置编码采用**相对位置编码**策略
 
 ---
@@ -43,11 +43,12 @@ sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " us
 ### 2.2 挑战2: 自定义Attention Pattern
 **问题**: 需要实现特殊的注意力模式：
 - 标准causal attention: token i 只能关注 [0, i]
-- 需求的pattern: chunk token可以关注sys_prompt（即使sys_prompt的物理位置在chunk之前）
+- 需求的pattern: chunk token可以关注sys_prompt + 同chunk内的前序token（chunk-isolated causal attention）
+- chunk i的token CANNOT关注 chunk j（j != i）的token
 
 **影响**:
 - 不能简单使用标准causal mask
-- 需要自定义attention mask来支持"跨越式"关注
+- 需要自定义attention mask来支持"chunk隔离的causal attention"
 
 ### 2.3 挑战3: 位置编码的语义一致性
 **问题**: RoPE通过旋转角度编码位置信息。如果两个token有相同的位置ID，它们会得到相同的旋转。
@@ -225,21 +226,22 @@ class ChunkAwareRotaryEmbedding(RotaryEmbedding):
 
 #### 4.2.1 设计原理
 
-**关键挑战**: 如何让chunk token关注sys_prompt，但不关注其他内容？
+**关键挑战**: 如何让chunk token关注sys_prompt和同chunk内的前序token，但不关注其他chunk？
 
-**解决方案**: 自定义attention mask
+**解决方案**: 自定义attention mask实现chunk-isolated causal attention
 
 ```python
 # Attention mask design
 # Rows: query tokens, Cols: key/value tokens
 # T=True (can attend), F=False (cannot attend)
+# causal=causal attention within the group
 
-#          sys_prompt  chunk1  chunk2  chunk3  question
-# sys_prompt    T        F       F       F        F
-# chunk1        T        F       F       F        F
-# chunk2        T        F       F       F        F
-# chunk3        T        F       F       F        F
-# question      T        T       T       T        T
+#          sys_prompt  chunk1_causal  chunk2_causal  chunk3_causal  question_causal
+# sys_prompt    T              F               F               F              F
+# chunk1        T         causal(T/T)          F               F              F
+# chunk2        T              F          causal(T/T)           F              F
+# chunk3        T              F               F          causal(T/T)          F
+# question      T              T               T               T         causal(T/T)
 ```
 
 #### 4.2.2 Attention Mask构建
@@ -252,13 +254,14 @@ def build_chunk_attention_mask(
     max_seq_len: int,
     chunk_ids: torch.Tensor,
     sys_prompt_end: int,
+    chunk_boundaries: list[tuple[int, int]],  # NEW: needed for intra-chunk causal
 ) -> torch.Tensor:
     """
     Build attention mask for chunk-aware attention.
 
     Rules:
     1. sys_prompt tokens: standard causal attention within sys_prompt
-    2. chunk tokens: can ONLY attend to sys_prompt tokens
+    2. chunk tokens: can attend to sys_prompt + earlier tokens in SAME chunk (causal)
     3. question tokens: can attend to everything (causal)
 
     Args:
@@ -266,6 +269,7 @@ def build_chunk_attention_mask(
         max_seq_len: Maximum sequence length
         chunk_ids: [-1=sys, 0,1,2,...=chunks, -2=question]
         sys_prompt_end: End of sys_prompt (exclusive)
+        chunk_boundaries: [(start1, end1), (start2, end2), ...] token positions
 
     Returns:
         attention_mask: [num_tokens, max_seq_len] bool tensor
@@ -276,8 +280,13 @@ def build_chunk_attention_mask(
         query_chunk_id = chunk_ids[query_pos].item()
 
         if query_chunk_id >= 0:  # Chunk token
-            # Can ONLY attend to sys_prompt
+            # Can attend to sys_prompt
             mask[query_pos, :sys_prompt_end] = True
+
+            # Can attend to earlier tokens in SAME chunk (causal)
+            chunk_start, chunk_end = chunk_boundaries[query_chunk_id]
+            causal_end = min(query_pos, chunk_end - 1) + 1  # +1 for slice
+            mask[query_pos, chunk_start:causal_end] = True
 
         elif query_chunk_id == -2:  # Question token
             # Can attend to everything before it (causal)
@@ -305,6 +314,7 @@ class ChunkAwareAttentionMetadata(FlashAttentionMetadata):
     # Chunk information
     chunk_ids: torch.Tensor | None = None  # [num_tokens]
     remapped_positions: torch.Tensor | None = None  # [num_tokens]
+    chunk_boundaries: list[tuple[int, int]] | None = None  # [(start1, end1), ...]
 
     # Pre-computed attention mask
     chunk_attn_mask: torch.Tensor | None = None  # [num_tokens, max_seq_len]
@@ -329,6 +339,7 @@ class ChunkAwareAttentionImpl(FlashAttentionImpl):
                 max_seq_len=kv_cache.shape[1],
                 chunk_ids=attn_metadata.chunk_ids,
                 sys_prompt_end=attn_metadata.sys_prompt_end,
+                chunk_boundaries=attn_metadata.chunk_boundaries,  # NEW parameter
             )
 
         # Apply mask to attention scores
@@ -697,7 +708,7 @@ outputs = llm.generate(prompt, SamplingParams(temperature=0.8))
 本设计通过以下核心技术实现多文档chunk的受限注意力：
 
 1. **位置编码重映射**: 多个chunk共享位置范围
-2. **自定义Attention Mask**: 限制chunk只能关注sys_prompt
+2. **自定义Attention Mask**: 实现chunk-isolated causal attention（chunk内causal，chunk间隔离）
 3. **Chunk-Aware Backend**: 无缝集成到vLLM架构
 4. **自动Chunk检测**: 用户友好的API
 
