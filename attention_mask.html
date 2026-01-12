@@ -1,0 +1,1506 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attention Mask 生成与传递机制设计文档</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <style>
+        :root {
+            --primary-color: #667eea;
+            --primary-dark: #5a67d8;
+            --secondary-color: #764ba2;
+            --success-color: #48bb78;
+            --warning-color: #ed8936;
+            --danger-color: #f56565;
+            --info-color: #4299e1;
+            --gray-50: #f7fafc;
+            --gray-100: #edf2f7;
+            --gray-200: #e2e8f0;
+            --gray-300: #cbd5e0;
+            --gray-400: #a0aec0;
+            --gray-500: #718096;
+            --gray-600: #4a5568;
+            --gray-700: #2d3748;
+            --gray-800: #1a202c;
+            --gray-900: #171923;
+            --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+            --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+            --shadow-xl: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
+            line-height: 1.7;
+            color: var(--gray-700);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background-attachment: fixed;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: var(--shadow-xl);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 60px 40px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(255,255,255,0.1) 0%, transparent 70%);
+            animation: pulse 15s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            50% { transform: translate(10%, 10%) scale(1.1); }
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin-bottom: 15px;
+            position: relative;
+            z-index: 1;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.95;
+            position: relative;
+            z-index: 1;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .toc {
+            background: linear-gradient(135deg, #f6f8fb 0%, #ffffff 100%);
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: var(--shadow-sm);
+            margin-bottom: 40px;
+            border: 1px solid var(--gray-200);
+        }
+
+        .toc h2 {
+            color: var(--gray-800);
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .toc h2 i {
+            color: var(--primary-color);
+        }
+
+        .toc ul {
+            list-style: none;
+            padding: 0;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 10px;
+        }
+
+        .toc li {
+            margin: 0;
+        }
+
+        .toc a {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--gray-600);
+            text-decoration: none;
+            padding: 10px 15px;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+            font-weight: 500;
+        }
+
+        .toc a:hover {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            transform: translateX(5px);
+            box-shadow: var(--shadow);
+        }
+
+        .toc a i {
+            font-size: 0.8em;
+            opacity: 0.6;
+        }
+
+        .section {
+            background: white;
+            padding: 35px;
+            border-radius: 15px;
+            margin-bottom: 30px;
+            box-shadow: var(--shadow-sm);
+            border: 1px solid var(--gray-100);
+            transition: all 0.3s ease;
+        }
+
+        .section:hover {
+            box-shadow: var(--shadow-md);
+        }
+
+        h2 {
+            color: var(--gray-800);
+            font-size: 1.8rem;
+            margin-bottom: 25px;
+            padding-bottom: 15px;
+            border-bottom: 3px solid;
+            border-image: linear-gradient(135deg, #667eea 0%, #764ba2 100%) 1;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h2 i {
+            color: var(--primary-color);
+        }
+
+        h3 {
+            color: var(--gray-700);
+            font-size: 1.3rem;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+
+        h4 {
+            color: var(--gray-600);
+            font-size: 1.1rem;
+            margin-top: 20px;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+
+        p {
+            margin-bottom: 15px;
+            color: var(--gray-600);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            margin: 25px 0;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+        }
+
+        th {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+
+        th:first-child {
+            border-top-left-radius: 10px;
+        }
+
+        th:last-child {
+            border-top-right-radius: 10px;
+        }
+
+        td {
+            padding: 15px;
+            border-bottom: 1px solid var(--gray-100);
+            background: white;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:nth-child(even) td {
+            background: var(--gray-50);
+        }
+
+        tr:hover td {
+            background: #f0f4ff;
+        }
+
+        pre {
+            background: var(--gray-800);
+            color: #e2e8f0;
+            padding: 25px;
+            border-radius: 12px;
+            overflow-x: auto;
+            margin: 20px 0;
+            box-shadow: var(--shadow);
+            border: 1px solid var(--gray-700);
+        }
+
+        code {
+            font-family: "Fira Code", "Monaco", "Menlo", "Ubuntu Mono", monospace;
+            font-size: 0.9rem;
+        }
+
+        p code, li code {
+            background: linear-gradient(135deg, #fed7e2 0%, #fbb6ce 100%);
+            color: #97266d;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.9em;
+        }
+
+        .diagram-box {
+            background: linear-gradient(135deg, #f6f8fb 0%, #ffffff 100%);
+            border-radius: 16px;
+            padding: 30px;
+            margin: 30px 0;
+            box-shadow: var(--shadow-md);
+            border: 1px solid var(--gray-200);
+        }
+
+        .diagram-title {
+            font-weight: 700;
+            color: var(--gray-800);
+            margin-bottom: 25px;
+            font-size: 1.3rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .diagram-title i {
+            color: var(--primary-color);
+        }
+
+        .collapsible {
+            border: 1px solid var(--gray-200);
+            border-radius: 12px;
+            margin: 15px 0;
+            overflow: hidden;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .collapsible-header {
+            background: linear-gradient(135deg, var(--gray-50) 0%, white 100%);
+            padding: 18px 20px;
+            cursor: pointer;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            user-select: none;
+            transition: all 0.3s ease;
+            color: var(--gray-700);
+        }
+
+        .collapsible-header:hover {
+            background: linear-gradient(135deg, #e2e8f0 0%, white 100%);
+            color: var(--primary-color);
+        }
+
+        .collapsible-header::after {
+            content: '\f078';
+            font-family: 'Font Awesome 6 Free';
+            font-weight: 900;
+            transition: transform 0.3s ease;
+            color: var(--primary-color);
+        }
+
+        .collapsible.active .collapsible-header::after {
+            transform: rotate(-180deg);
+        }
+
+        .collapsible-content {
+            padding: 0;
+            display: none;
+        }
+
+        .collapsible.active .collapsible-content {
+            display: block;
+            padding: 20px;
+            background: white;
+            border-top: 1px solid var(--gray-200);
+        }
+
+        .highlight {
+            background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-weight: 600;
+        }
+
+        .info-box, .warning-box, .success-box {
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 12px;
+            border-left: 5px solid;
+            display: flex;
+            align-items: flex-start;
+            gap: 15px;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .info-box {
+            background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
+            border-left-color: #0284c7;
+        }
+
+        .info-box i {
+            color: #0284c7;
+            font-size: 1.5rem;
+            flex-shrink: 0;
+        }
+
+        .warning-box {
+            background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+            border-left-color: #d97706;
+        }
+
+        .warning-box i {
+            color: #d97706;
+            font-size: 1.5rem;
+            flex-shrink: 0;
+        }
+
+        .success-box {
+            background: linear-gradient(135deg, #dcfce7 0%, #bbf7d0 100%);
+            border-left-color: #16a34a;
+        }
+
+        .success-box i {
+            color: #16a34a;
+            font-size: 1.5rem;
+            flex-shrink: 0;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+
+        .badge-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .badge-success {
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+            color: white;
+        }
+
+        .badge-warning {
+            background: linear-gradient(135deg, #ed8936 0%, #dd6b20 100%);
+            color: white;
+        }
+
+        .file-path {
+            background: var(--gray-100);
+            padding: 4px 10px;
+            border-radius: 6px;
+            font-family: "Fira Code", monospace;
+            font-size: 0.85rem;
+            color: #e53e3e;
+            border: 1px solid var(--gray-200);
+            display: inline-block;
+        }
+
+        ul {
+            padding-left: 25px;
+            color: var(--gray-600);
+        }
+
+        li {
+            margin: 10px 0;
+        }
+
+        .call-flow {
+            background: linear-gradient(135deg, #f6f8fb 0%, white 100%);
+            border: 1px solid var(--gray-200);
+            border-radius: 12px;
+            padding: 25px;
+            margin: 20px 0;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .call-step {
+            display: flex;
+            margin: 15px 0;
+            align-items: flex-start;
+        }
+
+        .call-step-number {
+            flex-shrink: 0;
+            width: 45px;
+            height: 45px;
+            line-height: 45px;
+            text-align: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 50%;
+            font-weight: bold;
+            margin-right: 20px;
+            box-shadow: var(--shadow);
+        }
+
+        .call-step-content {
+            flex: 1;
+        }
+
+        .call-step-title {
+            font-weight: 600;
+            color: var(--gray-800);
+            margin-bottom: 8px;
+            font-size: 1.05rem;
+        }
+
+        .call-step-detail {
+            color: var(--gray-500);
+            font-size: 0.95rem;
+        }
+
+        .mask-visual {
+            display: inline-block;
+            padding: 20px;
+            background: white;
+            border-radius: 12px;
+            margin: 15px 0;
+            box-shadow: var(--shadow);
+        }
+
+        .mask-grid {
+            display: grid;
+            gap: 3px;
+            font-family: monospace;
+        }
+
+        .mask-cell {
+            width: 45px;
+            height: 35px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .mask-cell-zero {
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+            color: white;
+        }
+
+        .mask-cell-inf {
+            background: linear-gradient(135deg, #f56565 0%, #e53e3e 100%);
+            color: white;
+        }
+
+        /* SVG Diagram Styles */
+        .svg-container {
+            width: 100%;
+            overflow-x: auto;
+            text-align: center;
+            padding: 20px 0;
+        }
+
+        svg {
+            max-width: 100%;
+            height: auto;
+            filter: drop-shadow(0 4px 6px rgba(0, 0, 0, 0.1));
+        }
+
+        .flow-box {
+            fill: url(#boxGradient);
+            stroke: url(#strokeGradient);
+            stroke-width: 2;
+            filter: url(#boxShadow);
+        }
+
+        .flow-box-text {
+            fill: white;
+            font-size: 14px;
+            font-weight: bold;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .flow-box-detail {
+            fill: rgba(255, 255, 255, 0.95);
+            font-size: 12px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .flow-arrow {
+            stroke: url(#arrowGradient);
+            stroke-width: 3;
+            fill: none;
+        }
+
+        .flow-arrow-head {
+            fill: url(#arrowGradient);
+        }
+
+        .sequence-actor {
+            fill: url(#actorGradient);
+            stroke: url(#strokeGradient);
+            stroke-width: 2;
+            filter: url(#boxShadow);
+        }
+
+        .sequence-actor-text {
+            fill: white;
+            font-size: 14px;
+            font-weight: bold;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .sequence-line {
+            stroke: var(--gray-300);
+            stroke-width: 2;
+            stroke-dasharray: 5,5;
+        }
+
+        .sequence-arrow {
+            stroke: var(--success-color);
+            stroke-width: 2;
+            fill: none;
+        }
+
+        .sequence-text {
+            fill: var(--gray-700);
+            font-size: 12px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .activation-box {
+            fill: rgba(102, 126, 234, 0.1);
+            stroke: var(--primary-color);
+            stroke-width: 2;
+        }
+
+        .back-to-top {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            width: 55px;
+            height: 55px;
+            border-radius: 50%;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            box-shadow: var(--shadow-lg);
+            transition: all 0.3s ease;
+            cursor: pointer;
+            z-index: 1000;
+        }
+
+        .back-to-top:hover {
+            transform: translateY(-5px);
+            box-shadow: var(--shadow-xl);
+        }
+
+        .back-to-top i {
+            font-size: 1.3rem;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+
+            .content {
+                padding: 20px;
+            }
+
+            .section {
+                padding: 20px;
+            }
+
+            .header {
+                padding: 40px 20px;
+            }
+
+            .header h1 {
+                font-size: 1.8rem;
+            }
+
+            .toc ul {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1><i class="fas fa-mask"></i> Attention Mask 生成与传递机制</h1>
+            <p>vLLM-Ascend 架构设计文档 | 深入解析 NPU 硬件下的 Attention Mask 实现</p>
+        </div>
+
+        <div class="content">
+            <div class="toc">
+                <h2><i class="fas fa-list-ul"></i> 目录</h2>
+                <ul>
+                    <li><a href="#overview"><i class="fas fa-eye"></i> 1. 概述</a></li>
+                    <li><a href="#vllm-mask"><i class="fas fa-microchip"></i> 2. vLLM 主干的 Attention Mask 处理</a></li>
+                    <li><a href="#ascend-mask"><i class="fas fa-server"></i> 3. vLLM-Ascend 的 Attention Mask 处理</a></li>
+                    <li><a href="#flow-diagram"><i class="fas fa-project-diagram"></i> 4. Mask 生成与传递的完整流程</a></li>
+                    <li><a href="#sequence-diagram"><i class="fas fa-sitemap"></i> 5. AttentionMaskBuilder 调用时序图</a></li>
+                    <li><a href="#npu-interface"><i class="fas fa-cogs"></i> 6. NPU 算子接口</a></li>
+                    <li><a href="#customization"><i class="fas fa-code"></i> 7. 定制化 Attention Mask 指南</a></li>
+                    <li><a href="#scenarios"><i class="fas fa-layer-group"></i> 8. 不同场景下的 Mask 处理</a></li>
+                    <li><a href="#performance"><i class="fas fa-tachometer-alt"></i> 9. 性能优化考虑</a></li>
+                    <li><a href="#summary"><i class="fas fa-clipboard-check"></i> 10. 总结</a></li>
+                </ul>
+            </div>
+
+            <!-- Section 1: Overview -->
+            <div id="overview" class="section">
+                <h2><i class="fas fa-eye"></i> 1. 概述</h2>
+                <p>本文档详细分析了在昇腾 (Ascend) 硬件下，Attention Mask 是如何生成并传递给算子的，以及如果要定制化生成 Attention Mask 需要修改哪些文件。</p>
+
+                <h3>1.1 核心发现</h3>
+                <p><strong>vLLM 和 vLLM-Ascend 在 Attention Mask 处理上的关键差异</strong>：</p>
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th><i class="fas fa-sliders-h"></i> 特性</th>
+                            <th>vLLM (CUDA)</th>
+                            <th>vLLM-Ascend (NPU)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Mask 方式</strong></td>
+                            <td><span class="badge badge-warning"><i class="fas fa-eye-slash"></i> 隐式</span> (通过 seq_lens)</td>
+                            <td><span class="badge badge-success"><i class="fas fa-eye"></i> 显式</span> (mask tensor)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Mask 传递</strong></td>
+                            <td>causal flag + seq_lens</td>
+                            <td>attn_mask tensor</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Mask 生成</strong></td>
+                            <td>不需要显式生成</td>
+                            <td>AttentionMaskBuilder</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Caching</strong></td>
+                            <td>无缓存</td>
+                            <td>Mask 缓存机制</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Section 2: vLLM Mask Handling -->
+            <div id="vllm-mask" class="section">
+                <h2><i class="fas fa-microchip"></i> 2. vLLM 主干的 Attention Mask 处理</h2>
+
+                <h3>2.1 核心设计理念</h3>
+                <p>vLLM 使用<span class="highlight">隐式 Mask</span> 方式，<strong>不显式创建 Attention Mask 张量</strong>。</p>
+
+                <div class="diagram-box">
+                    <div class="diagram-title"><i class="fas fa-diagram-project"></i> vLLM 隐式 Mask 架构</div>
+                    <div class="svg-container">
+                        <svg width="900" height="350" viewBox="0 0 900 350">
+                            <defs>
+                                <!-- Gradients -->
+                                <linearGradient id="boxGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="strokeGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                    <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="arrowGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                                    <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="inputGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#4299e1;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#3182ce;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="flashGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#48bb78;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#38a169;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="outputGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#f56565;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#e53e3e;stop-opacity:1" />
+                                </linearGradient>
+                                <filter id="boxShadow" x="-50%" y="-50%" width="200%" height="200%">
+                                    <feGaussianBlur in="SourceAlpha" stdDeviation="3"/>
+                                    <feOffset dx="2" dy="4" result="offsetblur"/>
+                                    <feComponentTransfer>
+                                        <feFuncA type="linear" slope="0.3"/>
+                                    </feComponentTransfer>
+                                    <feMerge>
+                                        <feMergeNode/>
+                                        <feMergeNode in="SourceGraphic"/>
+                                    </feMerge>
+                                </filter>
+                            </defs>
+
+                            <!-- Input Component -->
+                            <rect x="50" y="100" width="200" height="120" rx="15" class="flow-box" style="fill: url(#inputGradient);"/>
+                            <text x="150" y="130" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">输入信息</text>
+                            <text x="150" y="155" text-anchor="middle" class="flow-box-detail">seq_lens: [10, 20, 15]</text>
+                            <text x="150" y="175" text-anchor="middle" class="flow-box-detail">query_start_loc</text>
+                            <text x="150" y="195" text-anchor="middle" class="flow-box-detail">causal: True</text>
+
+                            <!-- Arrow -->
+                            <line x1="250" y1="160" x2="320" y2="160" class="flow-arrow"/>
+                            <polygon points="320,160 305,152 305,168" class="flow-arrow-head"/>
+
+                            <!-- FlashAttention Component -->
+                            <rect x="330" y="100" width="240" height="120" rx="15" class="flow-box" style="fill: url(#flashGradient);"/>
+                            <text x="450" y="130" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">FlashAttention Kernel</text>
+                            <text x="450" y="155" text-anchor="middle" class="flow-box-detail">cu_seqlens_q</text>
+                            <text x="450" y="175" text-anchor="middle" class="flow-box-detail">seqused_k</text>
+                            <text x="450" y="195" text-anchor="middle" class="flow-box-detail">causal=True</text>
+
+                            <!-- Arrow -->
+                            <line x1="570" y1="160" x2="640" y2="160" class="flow-arrow"/>
+                            <polygon points="640,160 625,152 625,168" class="flow-arrow-head"/>
+
+                            <!-- Output Component -->
+                            <rect x="650" y="110" width="200" height="100" rx="15" class="flow-box" style="fill: url(#outputGradient);"/>
+                            <text x="750" y="150" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">Attention Output</text>
+                            <text x="750" y="175" text-anchor="middle" class="flow-box-detail">隐式应用 mask</text>
+
+                            <!-- Bottom label -->
+                            <rect x="200" y="260" width="500" height="50" rx="25" fill="rgba(102, 126, 234, 0.1)" stroke="url(#strokeGradient)"/>
+                            <text x="450" y="290" text-anchor="middle" class="flow-box-detail" style="font-size: 15px; font-weight: 600;">vLLM 通过序列长度信息隐式应用 Mask</text>
+                        </svg>
+                    </div>
+                </div>
+
+                <h3>2.2 关键文件</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th><i class="fas fa-file-code"></i> 文件</th>
+                            <th><i class="fas fa-info-circle"></i> 功能</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="file-path">vllm/v1/attention/backends/utils.py</span></td>
+                            <td>CommonAttentionMetadata 定义</td>
+                        </tr>
+                        <tr>
+                            <td><span class="file-path">vllm/v1/attention/backends/flash_attn.py</span></td>
+                            <td>FlashAttention 实现</td>
+                        </tr>
+                        <tr>
+                            <td><span class="file-path">vllm/v1/worker/gpu_model_runner.py</span></td>
+                            <td>构建注意力元数据</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>2.3 CommonAttentionMetadata 结构</h3>
+                <pre><code>@dataclass
+class CommonAttentionMetadata:
+    query_start_loc: torch.Tensor        # (batch_size + 1,)
+    query_start_loc_cpu: torch.Tensor     # CPU 版本
+    seq_lens: torch.Tensor               # (batch_size,) 序列长度
+    num_reqs: int                        # 请求数量
+    num_actual_tokens: int               # 实际 token 数
+    max_query_len: int                   # 最大查询长度
+    max_seq_len: int                     # 最大序列长度
+    block_table_tensor: torch.Tensor     # PagedAttention 块表
+    slot_mapping: torch.Tensor           # KV cache slot 映射
+    causal: bool = True                  # 是否因果 masking
+    <span style="color: #e74c3c;"># 没有 attn_mask 字段！</span></code></pre>
+            </div>
+
+            <!-- Section 3: Ascend Mask Handling -->
+            <div id="ascend-mask" class="section">
+                <h2><i class="fas fa-server"></i> 3. vLLM-Ascend 的 Attention Mask 处理</h2>
+
+                <h3>3.1 核心设计理念</h3>
+                <p>vLLM-Ascend 使用<span class="highlight">显式 Mask</span> 方式，<strong>创建并传递 Mask 张量</strong>给 NPU 算子。</p>
+
+                <div class="diagram-box">
+                    <div class="diagram-title"><i class="fas fa-diagram-project"></i> vLLM-Ascend 显式 Mask 架构</div>
+                    <div class="svg-container">
+                        <svg width="1100" height="350" viewBox="0 0 1100 350">
+                            <defs>
+                                <linearGradient id="builderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#9f7aea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#805ad5;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="metadataGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#667eea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#764ba2;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="npuGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#ed8936;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#dd6b20;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="resultGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#48bb78;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#38a169;stop-opacity:1" />
+                                </linearGradient>
+                            </defs>
+
+                            <!-- AttentionMaskBuilder -->
+                            <rect x="30" y="100" width="220" height="130" rx="15" class="flow-box" style="fill: url(#builderGradient);"/>
+                            <text x="140" y="130" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">AttentionMaskBuilder</text>
+                            <text x="140" y="155" text-anchor="middle" class="flow-box-detail">单例模式</text>
+                            <text x="140" y="175" text-anchor="middle" class="flow-box-detail">生成并缓存 mask</text>
+                            <text x="140" y="195" text-anchor="middle" class="flow-box-detail">支持多种类型</text>
+
+                            <!-- Arrow -->
+                            <line x1="250" y1="165" x2="300" y2="165" class="flow-arrow"/>
+                            <polygon points="300,165 285,157 285,173" class="flow-arrow-head"/>
+
+                            <!-- AscendMetadata -->
+                            <rect x="310" y="100" width="220" height="130" rx="15" class="flow-box" style="fill: url(#metadataGradient);"/>
+                            <text x="420" y="130" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">AscendMetadata</text>
+                            <text x="420" y="155" text-anchor="middle" class="flow-box-detail">封装 mask 信息</text>
+                            <text x="420" y="175" text-anchor="middle" class="flow-box-detail">attn_mask</text>
+                            <text x="420" y="195" text-anchor="middle" class="flow-box-detail">swa_mask</text>
+
+                            <!-- Arrow -->
+                            <line x1="530" y1="165" x2="580" y2="165" class="flow-arrow"/>
+                            <polygon points="580,165 565,157 565,173" class="flow-arrow-head"/>
+
+                            <!-- NPU Kernel -->
+                            <rect x="590" y="100" width="220" height="130" rx="15" class="flow-box" style="fill: url(#npuGradient);"/>
+                            <text x="700" y="130" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">NPU Kernel</text>
+                            <text x="700" y="155" text-anchor="middle" class="flow-box-detail">npu_fused_attention</text>
+                            <text x="700" y="175" text-anchor="middle" class="flow-box-detail">显式传递 mask</text>
+                            <text x="700" y="195" text-anchor="middle" class="flow-box-detail">sparse_mode=3</text>
+
+                            <!-- Arrow -->
+                            <line x1="810" y1="165" x2="860" y2="165" class="flow-arrow"/>
+                            <polygon points="860,165 845,157 845,173" class="flow-arrow-head"/>
+
+                            <!-- Output -->
+                            <rect x="870" y="115" width="200" height="100" rx="15" class="flow-box" style="fill: url(#resultGradient);"/>
+                            <text x="970" y="155" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">Attention Output</text>
+                            <text x="970" y="180" text-anchor="middle" class="flow-box-detail">显式 mask 计算</text>
+
+                            <!-- Bottom label -->
+                            <rect x="250" y="260" width="600" height="50" rx="25" fill="rgba(102, 126, 234, 0.1)" stroke="url(#strokeGradient)"/>
+                            <text x="550" y="290" text-anchor="middle" class="flow-box-detail" style="font-size: 15px; font-weight: 600;">vLLM-Ascend 显式创建并传递 Mask 张量</text>
+                        </svg>
+                    </div>
+                </div>
+
+                <h3>3.2 关键文件</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th><i class="fas fa-file-code"></i> 文件</th>
+                            <th><i class="fas fa-info-circle"></i> 功能</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><span class="file-path">vllm-ascend/vllm_ascend/attention/attention_mask.py</span></td>
+                            <td>Mask 生成核心类</td>
+                        </tr>
+                        <tr>
+                            <td><span class="file-path">vllm-ascend/vllm_ascend/attention/attention_v1.py</span></td>
+                            <td>Ascend Attention Backend</td>
+                        </tr>
+                        <tr>
+                            <td><span class="file-path">vllm-ascend/vllm_ascend/attention/utils.py</span></td>
+                            <td>Ascend 通用元数据</td>
+                        </tr>
+                        <tr>
+                            <td><span class="file-path">vllm-ascend/vllm_ascend/worker/model_runner_v1.py</span></td>
+                            <td>NPU Model Runner</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h3>3.3 AttentionMaskBuilder 类详解</h3>
+                <div class="info-box">
+                    <i class="fas fa-map-marker-alt"></i>
+                    <div>
+                        <strong>位置:</strong> <span class="file-path">vllm-ascend/vllm_ascend/attention/attention_mask.py</span>
+                    </div>
+                </div>
+
+                <div class="collapsible">
+                    <div class="collapsible-header" onclick="toggleCollapsible(this)">
+                        AttentionMaskBuilder 类定义
+                    </div>
+                    <div class="collapsible-content">
+                        <pre><code>@singleton
+class AttentionMaskBuilder:
+    """单例模式，全局共享，缓存 mask 以避免重复生成"""
+
+    def __init__(self, device: torch.device):
+        self.attn_mask_cache = None          # 因果 mask 缓存
+        self._seq_len_cached = 0             # 缓存的序列长度
+        self.device = device
+        self.mla_mask = None                 # MLA mask 缓存
+        self.chunked_prefill_attn_mask = None
+        self.pcp_mla_mask = None
+        self.swa_mask = None                 # Sliding Window mask 缓存</code></pre>
+                    </div>
+                </div>
+
+                <h4>3.3.1 主要方法</h4>
+
+                <div class="call-flow">
+                    <div class="call-step">
+                        <div class="call-step-number">1</div>
+                        <div class="call-step-content">
+                            <div class="call-step-title">get_attn_mask(max_seq_len, dtype)</div>
+                            <div class="call-step-detail">获取因果 attention mask（下三角矩阵）</div>
+                        </div>
+                    </div>
+                    <div class="call-step">
+                        <div class="call-step-number">2</div>
+                        <div class="call-step-content">
+                            <div class="call-step-title">get_splitfuse_attn_mask()</div>
+                            <div class="call-step-detail">获取 chunked prefill mask (2048x2048 上三角)</div>
+                        </div>
+                    </div>
+                    <div class="call-step">
+                        <div class="call-step-number">3</div>
+                        <div class="call-step-content">
+                            <div class="call-step-title">get_mla_mask(dtype)</div>
+                            <div class="call-step-detail">获取 MLA mask (512x512)</div>
+                        </div>
+                    </div>
+                    <div class="call-step">
+                        <div class="call-step-number">4</div>
+                        <div class="call-step-content">
+                            <div class="call-step-title">get_swa_mask(dtype, sliding_window)</div>
+                            <div class="call-step-detail">获取 Sliding Window Attention mask</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 4: Flow Diagram -->
+            <div id="flow-diagram" class="section">
+                <h2><i class="fas fa-project-diagram"></i> 4. Mask 生成与传递的完整流程</h2>
+
+                <div class="diagram-box">
+                    <div class="diagram-title"><i class="fas fa-diagram-project"></i> 从用户请求到 Attention 输出的完整流程</div>
+                    <div class="svg-container">
+                        <svg width="700" height="1200" viewBox="0 0 700 1200">
+                            <!-- User Request -->
+                            <rect x="200" y="30" width="300" height="60" rx="30" class="flow-box" style="fill: url(#outputGradient);"/>
+                            <text x="350" y="55" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">用户请求</text>
+                            <text x="350" y="75" text-anchor="middle" class="flow-box-detail">generate / API 调用</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="90" x2="350" y2="130" class="flow-arrow"/>
+                            <polygon points="350,130 342,118 358,118" class="flow-arrow-head"/>
+
+                            <!-- InputProcessor -->
+                            <rect x="100" y="140" width="500" height="90" rx="15" class="flow-box" style="fill: url(#inputGradient);"/>
+                            <text x="350" y="170" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">1. InputProcessor</text>
+                            <text x="350" y="195" text-anchor="middle" class="flow-box-detail">- Tokenize 提示词</text>
+                            <text x="350" y="215" text-anchor="middle" class="flow-box-detail">- 验证采样参数</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="230" x2="350" y2="270" class="flow-arrow"/>
+                            <polygon points="350,270 342,258 358,258" class="flow-arrow-head"/>
+
+                            <!-- Scheduler -->
+                            <rect x="100" y="280" width="500" height="90" rx="15" class="flow-box" style="fill: url(#inputGradient);"/>
+                            <text x="350" y="310" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">2. Scheduler</text>
+                            <text x="350" y="335" text-anchor="middle" class="flow-box-detail">- 调度请求</text>
+                            <text x="350" y="355" text-anchor="middle" class="flow-box-detail">- 分配 KV cache 块</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="370" x2="350" y2="410" class="flow-arrow"/>
+                            <polygon points="350,410 342,398 358,398" class="flow-arrow-head"/>
+
+                            <!-- NPUModelRunner -->
+                            <rect x="100" y="420" width="500" height="90" rx="15" class="flow-box" style="fill: url(#inputGradient);"/>
+                            <text x="350" y="450" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">3. NPUModelRunner</text>
+                            <text x="350" y="475" text-anchor="middle" class="flow-box-detail">- 构建序列信息</text>
+                            <text x="350" y="495" text-anchor="middle" class="flow-box-detail">- 准备输入批次</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="510" x2="350" y2="550" class="flow-arrow"/>
+                            <polygon points="350,550 342,538 358,538" class="flow-arrow-head"/>
+
+                            <!-- AttentionMaskBuilder -->
+                            <rect x="100" y="560" width="500" height="90" rx="15" class="flow-box" style="fill: url(#builderGradient);"/>
+                            <text x="350" y="585" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">4. AttentionMaskBuilder.get_attention_mask()</text>
+                            <text x="350" y="610" text-anchor="middle" class="flow-box-detail">- 检查缓存</text>
+                            <text x="350" y="630" text-anchor="middle" class="flow-box-detail">- 生成或复用 mask 张量</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="650" x2="350" y2="690" class="flow-arrow"/>
+                            <polygon points="350,690 342,678 358,678" class="flow-arrow-head"/>
+
+                            <!-- AscendMetadata -->
+                            <rect x="100" y="700" width="500" height="110" rx="15" class="flow-box" style="fill: url(#metadataGradient);"/>
+                            <text x="350" y="730" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">5. AscendMetadata</text>
+                            <text x="350" y="755" text-anchor="middle" class="flow-box-detail">attn_mask=attn_mask</text>
+                            <text x="350" y="775" text-anchor="middle" class="flow-box-detail">swa_mask=swa_mask (如果启用)</text>
+                            <text x="350" y="795" text-anchor="middle" class="flow-box-detail">seq_lens, block_tables, ...</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="810" x2="350" y2="850" class="flow-arrow"/>
+                            <polygon points="350,850 342,838 358,838" class="flow-arrow-head"/>
+
+                            <!-- AttentionImpl.forward -->
+                            <rect x="100" y="860" width="500" height="90" rx="15" class="flow-box" style="fill: url(#npuGradient);"/>
+                            <text x="350" y="885" text-anchor="middle" class="flow-box-text" style="font-size: 16px;">6. AttentionImpl.forward()</text>
+                            <text x="350" y="910" text-anchor="middle" class="flow-box-detail">使用 attn_metadata.attn_mask</text>
+                            <text x="350" y="930" text-anchor="middle" class="flow-box-detail">显式传递给 NPU kernel</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="950" x2="350" y2="990" class="flow-arrow"/>
+                            <polygon points="350,990 342,978 358,978" class="flow-arrow-head"/>
+
+                            <!-- NPU Kernel -->
+                            <rect x="100" y="1000" width="500" height="130" rx="15" class="flow-box" style="fill: url(#resultGradient);"/>
+                            <text x="350" y="1030" text-anchor="middle" class="flow-box-text" style="font-size: 15px;">7. torch_npu.npu_fused_infer_attention_score</text>
+                            <text x="350" y="1055" text-anchor="middle" class="flow-box-detail">atten_mask=attn_metadata.attn_mask</text>
+                            <text x="350" y="1075" text-anchor="middle" class="flow-box-detail">sparse_mode=3 (因果 attention)</text>
+                            <text x="350" y="1095" text-anchor="middle" class="flow-box-detail">...</text>
+
+                            <!-- Arrow -->
+                            <line x1="350" y1="1130" x2="350" y2="1155" class="flow-arrow"/>
+                            <polygon points="350,1155 342,1143 358,1143" class="flow-arrow-head"/>
+
+                            <!-- Output -->
+                            <rect x="250" y="1160" width="200" height="40" rx="20" class="flow-box" style="fill: url(#outputGradient);"/>
+                            <text x="350" y="1185" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">Attention Output</text>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 5: Sequence Diagram -->
+            <div id="sequence-diagram" class="section">
+                <h2><i class="fas fa-sitemap"></i> 5. AttentionMaskBuilder 调用时序图</h2>
+
+                <div class="diagram-box">
+                    <div class="diagram-title"><i class="fas fa-project-diagram"></i> AttentionMaskBuilder 方法调用时序图</div>
+                    <div class="svg-container">
+                        <svg width="1100" height="750" viewBox="0 0 1100 750">
+                            <defs>
+                                <linearGradient id="actorGradient1" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#4299e1;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#3182ce;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="actorGradient2" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#9f7aea;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#805ad5;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="actorGradient3" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#ed8936;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#dd6b20;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="actorGradient4" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#48bb78;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#38a169;stop-opacity:1" />
+                                </linearGradient>
+                            </defs>
+
+                            <!-- Actors -->
+                            <rect x="50" y="30" width="160" height="50" rx="10" class="sequence-actor" style="fill: url(#actorGradient1);"/>
+                            <text x="130" y="60" text-anchor="middle" class="sequence-actor-text">ModelRunner</text>
+
+                            <rect x="280" y="30" width="200" height="50" rx="10" class="sequence-actor" style="fill: url(#actorGradient2);"/>
+                            <text x="380" y="60" text-anchor="middle" class="sequence-actor-text">MetadataBuilder</text>
+
+                            <rect x="540" y="30" width="180" height="50" rx="10" class="sequence-actor" style="fill: url(#actorGradient3);"/>
+                            <text x="630" y="60" text-anchor="middle" class="sequence-actor-text">MaskBuilder</text>
+
+                            <rect x="780" y="30" width="180" height="50" rx="10" class="sequence-actor" style="fill: url(#actorGradient4);"/>
+                            <text x="870" y="60" text-anchor="middle" class="sequence-actor-text">Metadata</text>
+
+                            <!-- Lifelines -->
+                            <line x1="130" y1="80" x2="130" y2="680" class="sequence-line"/>
+                            <line x1="380" y1="80" x2="380" y2="680" class="sequence-line"/>
+                            <line x1="630" y1="80" x2="630" y2="680" class="sequence-line"/>
+                            <line x1="870" y1="80" x2="870" y2="680" class="sequence-line"/>
+
+                            <!-- Activation Box for ModelRunner -->
+                            <rect x="125" y="100" width="10" height="550" class="activation-box"/>
+
+                            <!-- Activation Box for MetadataBuilder -->
+                            <rect x="375" y="120" width="10" height="400" class="activation-box"/>
+
+                            <!-- Activation Box for MaskBuilder -->
+                            <rect x="625" y="140" width="10" height="200" class="activation-box"/>
+
+                            <!-- Call 1: ModelRunner -> MetadataBuilder -->
+                            <line x1="135" y1="140" x2="375" y2="140" class="sequence-arrow"/>
+                            <polygon points="375,140 360,132 360,148" class="flow-arrow-head"/>
+                            <text x="255" y="130" text-anchor="middle" class="sequence-text">build(common_metadata)</text>
+
+                            <!-- Call 2: MetadataBuilder -> MaskBuilder -->
+                            <line x1="385" y1="200" x2="625" y2="200" class="sequence-arrow"/>
+                            <polygon points="625,200 610,192 610,208" class="flow-arrow-head"/>
+                            <text x="505" y="190" text-anchor="middle" class="sequence-text">get_attention_mask(config)</text>
+
+                            <!-- Processing in MaskBuilder -->
+                            <rect x="610" y="230" width="40" height="80" fill="rgba(237, 137, 54, 0.1)" stroke="#ed8936" rx="5"/>
+                            <text x="630" y="255" text-anchor="middle" class="sequence-text">检查缓存</text>
+                            <text x="630" y="275" text-anchor="middle" class="sequence-text">生成/复用</text>
+
+                            <!-- Return 2 -->
+                            <line x1="625" y1="320" x2="385" y2="320" class="sequence-arrow" style="stroke: #f56565; stroke-dasharray: 4,4;"/>
+                            <polygon points="385,320 400,312 400,328" style="fill: #f56565;"/>
+                            <text x="505" y="310" text-anchor="middle" class="sequence-text" style="fill: #f56565;">return attn_mask</text>
+
+                            <!-- Call 3: SWA (optional) -->
+                            <line x1="385" y1="360" x2="625" y2="360" class="sequence-arrow"/>
+                            <polygon points="625,360 610,352 610,368" class="flow-arrow-head"/>
+                            <text x="505" y="350" text-anchor="middle" class="sequence-text">get_swa_mask() (可选)</text>
+
+                            <!-- Return 3 -->
+                            <line x1="625" y1="400" x2="385" y2="400" class="sequence-arrow" style="stroke: #f56565; stroke-dasharray: 4,4;"/>
+                            <polygon points="385,400 400,392 400,408" style="fill: #f56565;"/>
+                            <text x="505" y="390" text-anchor="middle" class="sequence-text" style="fill: #f56565;">return swa_mask</text>
+
+                            <!-- Return 1 -->
+                            <line x1="375" y1="500" x2="135" y2="500" class="sequence-arrow" style="stroke: #f56565; stroke-dasharray: 4,4;"/>
+                            <polygon points="135,500 150,492 150,508" style="fill: #f56565;"/>
+                            <text x="255" y="490" text-anchor="middle" class="sequence-text" style="fill: #f56565;">return AscendMetadata</text>
+
+                            <!-- Call 4: Forward -->
+                            <rect x="125" y="540" width="10" height="100" class="activation-box" style="fill: rgba(72, 187, 120, 0.2); stroke: #48bb78;"/>
+                            <text x="145" y="565" text-anchor="start" class="sequence-text">forward(q, k, v)</text>
+                            <text x="145" y="585" text-anchor="start" class="sequence-text">使用 attn_mask</text>
+                            <text x="145" y="605" text-anchor="start" class="sequence-text">调用 NPU kernel</text>
+
+                            <!-- Final Return -->
+                            <rect x="50" y="650" width="120" height="40" fill="rgba(72, 187, 120, 0.2)" stroke="#48bb78" rx="8"/>
+                            <text x="110" y="675" text-anchor="middle" class="sequence-text" style="fill: #38a169; font-weight: 600;">Attention Output</text>
+
+                            <line x1="125" y1="670" x2="170" y2="670" class="sequence-arrow"/>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 6: NPU Interface -->
+            <div id="npu-interface" class="section">
+                <h2><i class="fas fa-cogs"></i> 6. NPU 算子接口</h2>
+
+                <h3>6.1 torch_npu.npu_fused_infer_attention_score</h3>
+                <div class="diagram-box">
+                    <div class="diagram-title"><i class="fas fa-terminal"></i> NPU Attention Kernel 接口</div>
+                    <div class="svg-container">
+                        <svg width="800" height="550" viewBox="0 0 800 550">
+                            <defs>
+                                <linearGradient id="terminalGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#1a202c;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#2d3748;stop-opacity:1" />
+                                </linearGradient>
+                            </defs>
+
+                            <!-- Main box -->
+                            <rect x="50" y="30" width="700" height="500" rx="15" fill="url(#terminalGradient)" stroke="#4a5568" stroke-width="2"/>
+
+                            <!-- Title bar -->
+                            <rect x="50" y="30" width="700" height="50" rx="15" fill="#1a202c"/>
+                            <circle cx="80" cy="55" r="8" fill="#fc8181"/>
+                            <circle cx="105" cy="55" r="8" fill="#f6e05e"/>
+                            <circle cx="130" cy="55" r="8" fill="#68d391"/>
+                            <text x="400" y="60" text-anchor="middle" fill="#667eea" font-size="14" font-weight="bold">torch_npu.npu_fused_infer_attention_score()</text>
+
+                            <!-- Parameters -->
+                            <g transform="translate(80, 110)">
+                                <text y="0" fill="#e2e8f0" font-size="13" font-family="monospace">query: torch.Tensor           <tspan fill="#718096"># [num_tokens, num_heads, head_size]</tspan></text>
+                                <text y="30" fill="#e2e8f0" font-size="13" font-family="monospace">key: torch.Tensor              <tspan fill="#718096"># [num_tokens, num_kv_heads, head_size]</tspan></text>
+                                <text y="60" fill="#e2e8f0" font-size="13" font-family="monospace">value: torch.Tensor            <tspan fill="#718096"># [num_tokens, num_kv_heads, head_size]</tspan></text>
+                                <text y="90" fill="#fc8181" font-size="13" font-weight="bold" font-family="monospace">atten_mask: torch.Tensor       <tspan fill="#fc8181"># [max_seq_len, max_seq_len] ← 显式 mask!</tspan></text>
+                                <text y="120" fill="#e2e8f0" font-size="13" font-family="monospace">block_table: torch.Tensor      <tspan fill="#718096"># PagedAttention 块表</tspan></text>
+                                <text y="150" fill="#e2e8f0" font-size="13" font-family="monospace">input_layout: str              <tspan fill="#718096"># "TND", "BSH", etc.</tspan></text>
+                                <text y="180" fill="#e2e8f0" font-size="13" font-family="monospace">block_size: int                <tspan fill="#718096"># 块大小 (128)</tspan></text>
+                                <text y="210" fill="#e2e8f0" font-size="13" font-family="monospace">actual_seq_lengths: List[int]  <tspan fill="#718096"># 实际序列长度</tspan></text>
+                                <text y="240" fill="#e2e8f0" font-size="13" font-family="monospace">actual_seq_lengths_kv: List[int]</text>
+                                <text y="270" fill="#e2e8f0" font-size="13" font-family="monospace">num_key_value_heads: int</text>
+                                <text y="300" fill="#e2e8f0" font-size="13" font-family="monospace">num_heads: int</text>
+                                <text y="330" fill="#e2e8f0" font-size="13" font-family="monospace">scale: float</text>
+                                <text y="360" fill="#667eea" font-size="13" font-weight="bold" font-family="monospace">sparse_mode: int               <tspan fill="#667eea"># 0=None, 1=Left, 2=Right, 3=Causal</tspan></text>
+                                <text y="390" fill="#ed8936" font-size="13" font-family="monospace">pre_tokens: int = None         <tspan fill="#ed8936"># Sliding window: pre tokens</tspan></text>
+                                <text y="420" fill="#ed8936" font-size="13" font-family="monospace">next_tokens: int = None        <tspan fill="#ed8936"># Sliding window: next tokens</tspan></text>
+                            </g>
+                        </svg>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Section 7: Customization -->
+            <div id="customization" class="section">
+                <h2><i class="fas fa-code"></i> 7. 定制化 Attention Mask 指南</h2>
+
+                <div class="info-box">
+                    <i class="fas fa-lightbulb"></i>
+                    <div>
+                        <strong>场景：</strong> 需要添加自定义 Mask 类型（如特定稀疏模式、自定义窗口等）
+                    </div>
+                </div>
+
+                <h3>7.1 实施步骤</h3>
+                <div class="svg-container">
+                    <svg width="1000" height="400" viewBox="0 0 1000 400">
+                        <!-- Step 1 -->
+                        <rect x="30" y="50" width="280" height="70" rx="15" class="flow-box" style="fill: url(#builderGradient);"/>
+                        <text x="170" y="75" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">1. 扩展 AttentionMaskBuilder</text>
+                        <text x="170" y="100" text-anchor="middle" class="flow-box-detail">添加 get_custom_mask()</text>
+
+                        <!-- Arrow -->
+                        <line x1="310" y1="85" x2="350" y2="85" class="flow-arrow"/>
+                        <polygon points="350,85 335,77 335,93" class="flow-arrow-head"/>
+
+                        <!-- Step 2 -->
+                        <rect x="360" y="50" width="280" height="70" rx="15" class="flow-box" style="fill: url(#metadataGradient);"/>
+                        <text x="500" y="75" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">2. 扩展 AscendMetadata</text>
+                        <text x="500" y="100" text-anchor="middle" class="flow-box-detail">添加 custom_mask 字段</text>
+
+                        <!-- Arrow -->
+                        <line x1="640" y1="85" x2="680" y2="85" class="flow-arrow"/>
+                        <polygon points="680,85 665,77 665,93" class="flow-arrow-head"/>
+
+                        <!-- Step 3 -->
+                        <rect x="690" y="50" width="280" height="70" rx="15" class="flow-box" style="fill: url(#npuGradient);"/>
+                        <text x="830" y="75" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">3. 修改 MetadataBuilder</text>
+                        <text x="830" y="100" text-anchor="middle" class="flow-box-detail">调用 get_custom_mask()</text>
+
+                        <!-- Arrow down -->
+                        <line x1="830" y1="120" x2="830" y2="170" class="flow-arrow"/>
+                        <polygon points="830,170 822,155 838,155" class="flow-arrow-head"/>
+
+                        <!-- Step 4 -->
+                        <rect x="690" y="180" width="280" height="70" rx="15" class="flow-box" style="fill: url(#resultGradient);"/>
+                        <text x="830" y="205" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">4. 修改 AttentionImpl</text>
+                        <text x="830" y="230" text-anchor="middle" class="flow-box-detail">在 forward() 中使用</text>
+
+                        <!-- Arrow left -->
+                        <line x1="690" y1="215" x2="640" y2="215" class="flow-arrow"/>
+                        <polygon points="640,215 655,207 655,223" class="flow-arrow-head"/>
+
+                        <!-- Step 5 -->
+                        <rect x="360" y="180" width="280" height="70" rx="15" class="flow-box" style="fill: url(#outputGradient);"/>
+                        <text x="500" y="205" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">5. 添加配置支持</text>
+                        <text x="500" y="230" text-anchor="middle" class="flow-box-detail">控制自定义 mask</text>
+
+                        <!-- Arrow left -->
+                        <line x1="360" y1="215" x2="310" y2="215" class="flow-arrow"/>
+                        <polygon points="310,215 325,207 325,223" class="flow-arrow-head"/>
+
+                        <!-- Step 6 -->
+                        <rect x="30" y="180" width="280" height="70" rx="15" class="flow-box" style="fill: url(#inputGradient);"/>
+                        <text x="170" y="205" text-anchor="middle" class="flow-box-text" style="font-size: 14px;">6. 添加测试</text>
+                        <text x="170" y="230" text-anchor="middle" class="flow-box-detail">验证自定义 mask</text>
+
+                        <!-- Legend -->
+                        <rect x="200" y="300" width="600" height="70" rx="15" fill="rgba(102, 126, 234, 0.1)" stroke="url(#strokeGradient)"/>
+                        <text x="500" y="330" text-anchor="middle" class="flow-box-detail" style="font-size: 15px; font-weight: 600;">实施流程：按顺序完成以上 6 个步骤</text>
+                        <text x="500" y="355" text-anchor="middle" class="flow-box-detail">每个步骤都依赖于前一个步骤的完成</text>
+                    </svg>
+                </div>
+            </div>
+
+            <!-- Section 8: Scenarios -->
+            <div id="scenarios" class="section">
+                <h2><i class="fas fa-layer-group"></i> 8. 不同场景下的 Mask 处理</h2>
+
+                <h3>8.1 场景对比</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th><i class="fas fa-question-circle"></i> 场景</th>
+                            <th><i class="fas fa-th"></i> Mask 类型</th>
+                            <th><i class="fas fa-code"></i> 调用方法</th>
+                            <th><i class="fas fa-vector-square"></i> Mask 形状</th>
+                            <th><i class="fas fa-star"></i> 典型模型</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>标准因果 Attention</td>
+                            <td>下三角矩阵</td>
+                            <td><code>get_attn_mask()</code></td>
+                            <td>(max_seq_len, max_seq_len)</td>
+                            <td>GPT, LLaMA, ChatGLM</td>
+                        </tr>
+                        <tr>
+                            <td>Sliding Window Attention</td>
+                            <td>带状 mask</td>
+                            <td><code>get_swa_mask()</code></td>
+                            <td>(2048, 2048)</td>
+                            <td>Mistral, LongContext</td>
+                        </tr>
+                        <tr>
+                            <td>Multi-head Latent Attention</td>
+                            <td>压缩 mask</td>
+                            <td><code>get_mla_mask()</code></td>
+                            <td>(512, 512)</td>
+                            <td>DeepSeek-V3</td>
+                        </tr>
+                        <tr>
+                            <td>Chunked Prefill</td>
+                            <td>上三角矩阵</td>
+                            <td><code>get_splitfuse_attn_mask()</code></td>
+                            <td>(2048, 2048)</td>
+                            <td>所有预填充优化场景</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Section 9: Performance -->
+            <div id="performance" class="section">
+                <h2><i class="fas fa-tachometer-alt"></i> 9. 性能优化考虑</h2>
+
+                <h3>9.1 Mask 缓存机制</h3>
+                <div class="success-box">
+                    <i class="fas fa-rocket"></i>
+                    <div>
+                        <strong>单例模式 + 缓存 = 性能优化</strong>
+                    </div>
+                </div>
+                <ul>
+                    <li><i class="fas fa-check-circle" style="color: #48bb78;"></i> <strong>避免重复生成</strong>：相同大小的 mask 只生成一次</li>
+                    <li><i class="fas fa-check-circle" style="color: #48bb78;"></i> <strong>减少 H2D 传输</strong>：缓存的 mask 常驻 NPU 内存</li>
+                    <li><i class="fas fa-check-circle" style="color: #48bb78;"></i> <strong>降低内存分配</strong>：复用已分配的内存</li>
+                </ul>
+            </div>
+
+            <!-- Section 10: Summary -->
+            <div id="summary" class="section">
+                <h2><i class="fas fa-clipboard-check"></i> 10. 总结</h2>
+
+                <h3>10.1 核心要点</h3>
+                <div class="info-box">
+                    <i class="fas fa-info-circle"></i>
+                    <ol style="margin: 0;">
+                        <li><strong>vLLM 主干</strong>：使用隐式 mask，通过 <code>seq_lens</code> 和 <code>causal flag</code> 实现</li>
+                        <li><strong>vLLM-Ascend</strong>：使用显式 mask，创建并传递 mask tensor</li>
+                        <li><strong>Mask 生成</strong>：<code>AttentionMaskBuilder</code> 单例类负责生成和缓存 mask</li>
+                        <li><strong>Mask 传递</strong>：通过 <code>AscendMetadata.attn_mask</code> 传递给 NPU 算子</li>
+                        <li><strong>NPU 算子</strong>：<code>torch_npu.npu_fused_infer_attention_score</code> 接收 mask 参数</li>
+                    </ol>
+                </div>
+            </div>
+
+            <div style="text-align: center; margin-top: 50px; padding: 30px; background: linear-gradient(135deg, rgba(102, 126, 234, 0.1) 0%, rgba(118, 75, 162, 0.1) 100%); border-radius: 15px;">
+                <p style="color: var(--gray-600); font-size: 1.1rem; margin-bottom: 10px;">
+                    <i class="fas fa-file-alt" style="color: var(--primary-color);"></i>
+                    vLLM-Ascend Architecture Documentation
+                </p>
+                <p style="color: var(--gray-500); font-size: 0.95rem;">Generated for research and development purposes</p>
+            </div>
+        </div>
+    </div>
+
+    <a href="#" class="back-to-top" id="backToTop">
+        <i class="fas fa-arrow-up"></i>
+    </a>
+
+    <script>
+        // Collapsible sections
+        function toggleCollapsible(element) {
+            element.parentElement.classList.toggle('active');
+        }
+
+        // Smooth scroll for anchor links
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+
+        // Back to top button
+        const backToTop = document.getElementById('backToTop');
+
+        window.addEventListener('scroll', () => {
+            if (window.pageYOffset > 300) {
+                backToTop.style.display = 'flex';
+            } else {
+                backToTop.style.display = 'none';
+            }
+        });
+
+        // Smooth scroll for back to top
+        backToTop.addEventListener('click', (e) => {
+            e.preventDefault();
+            window.scrollTo({
+                top: 0,
+                behavior: 'smooth'
+            });
+        });
+
+        // Highlight current section in TOC
+        const sections = document.querySelectorAll('.section');
+        const tocLinks = document.querySelectorAll('.toc a');
+
+        window.addEventListener('scroll', () => {
+            let current = '';
+            sections.forEach(section => {
+                const sectionTop = section.offsetTop;
+                if (pageYOffset >= sectionTop - 150) {
+                    current = section.getAttribute('id');
+                }
+            });
+
+            tocLinks.forEach(link => {
+                link.style.color = '';
+                if (link.getAttribute('href') === '#' + current) {
+                    link.style.color = '#667eea';
+                }
+            });
+        });
+    </script>
+</body>
+</html>

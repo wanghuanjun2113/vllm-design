@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"D:\\\\code\\\\vllm\\\\vllm-ascend\" log --oneline -10)",
+      "Bash(start:*)",
+      "Bash(start \"\" \"D:\\\\code\\\\vllm\\\\attention_mask.html\")",
+      "WebSearch",
+      "Bash(dir \"D:\\\\code\\\\vllm\")",
+      "Bash(tasklist:*)",
+      "Bash(dir:*)",
+      "Bash(cmd /c \"wmic process where \"\"name=''node.exe''\"\" get commandline 2>nul | findstr claude\")",
+      "Bash(cat:*)",
+      "Bash(find:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git remote add:*)",
+      "Bash(git branch:*)",
+      "Bash(git push:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}
