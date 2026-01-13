@@ -2,7 +2,6 @@
 vllm/
 vllm-ascend/
 LMCache/
-vllm-blend/
 
 # Python
 __pycache__/
