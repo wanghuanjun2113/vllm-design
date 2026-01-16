@@ -1055,74 +1055,182 @@ class PositionRemapper:
         self._free_to_main_pool(block_ids)
 ```
 
-### 4.3 GPUModelRunner
+### 4.3 ChunkedPromptParser
 
 ```python
-from typing import List, Optional, TYPE_CHECKING
-from abc import abstractmethod
+import torch
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
-if TYPE_CHECKING:
-    from vllm.v1.core.chunk_cache_manager import ChunkCacheManager
+
+@dataclass
+class ChunkedPrompt:
+    """
+    分块提示词结构
+
+    设计参考 LMcache SegmentTokenDatabase:
+    - 使用特殊分隔符识别chunks
+    - 支持快速滑动窗口匹配
+    - 返回每个chunk的边界和token
+    """
+    sys_prompt: List[int]          # 第一个chunk (特殊)
+    chunks: List[List[int]]         # 文档chunks
+    user_question: List[int]        # 用户问题
+    separator: str = "##"
+
+    # Chunk边界信息 (用于attention mask)
+    chunk_boundaries: List[Tuple[int, int]] = None
+
+    def __post_init__(self):
+        """初始化chunk边界"""
+        if self.chunk_boundaries is None:
+            self._compute_chunk_boundaries()
+
+    def get_all_chunks(self) -> List[List[int]]:
+        """获取所有需要缓存的chunks (包括sys_prompt)"""
+        return [self.sys_prompt] + self.chunks
+
+    def _compute_chunk_boundaries(self):
+        """计算chunk边界 [(start, end), ...]"""
+        boundaries = []
+        current_pos = 0
+
+        # sys_prompt
+        boundaries.append((current_pos, current_pos + len(self.sys_prompt)))
+        current_pos += len(self.sys_prompt)
+
+        # chunks
+        for chunk in self.chunks:
+            boundaries.append((current_pos, current_pos + len(chunk)))
+            current_pos += len(chunk)
+
+        self.chunk_boundaries = boundaries
 
 
 class ChunkedPromptParser:
-    """分块提示词解析器"""
+    """
+    分块提示词解析器
 
-    def __init__(self, tokenizer, separator: str = "##"):
+    设计参考 LMcache SegmentTokenDatabase:
+    - 使用滑动窗口快速匹配分隔符
+    - 支持torch.Tensor和List[int]输入
+    - 高效的分隔符查找
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        separator: str = "##",
+        device: torch.device = torch.device("cpu"),
+    ):
         """
         初始化
 
         Args:
             tokenizer: 分词器
-            separator: 分隔符字符串
+            separator: 分隔符字符串 (默认 "##")
+            device: 分隔符tokens所在设备
         """
         self.tokenizer = tokenizer
         self.separator = separator
-        self.separator_tokens = tokenizer.encode(
-            separator,
-            add_special_tokens=False,
+
+        # 编码分隔符 (移除第一个token，通常是BOS)
+        sep_tokens_full = tokenizer.encode(separator, add_special_tokens=False)
+        self.sep_tokens = torch.tensor(
+            sep_tokens_full[1:] if sep_tokens_full else sep_tokens_full,
+            dtype=torch.long,
+            device=device,
         )
+        self.sep_len = len(self.sep_tokens)
 
     def parse(
         self,
-        prompt_tokens: List[int],
+        prompt_tokens: Union[torch.Tensor, List[int]],
         prompt_str: Optional[str] = None,
     ) -> ChunkedPrompt:
         """
-        解析分块提示词
+        解析分块提示词 (优化版本，参考LMcache)
 
         Args:
-            prompt_tokens: token序列
+            prompt_tokens: token序列 (torch.Tensor或List[int])
             prompt_str: 原始字符串 (可选，用于验证)
 
         Returns:
             ChunkedPrompt: 解析后的分块结构
 
         Raises:
-            ValueError: 格式错误 (无分隔符、空chunk等)
-        """
-        # 查找所有分隔符位置
-        sep_positions = self._find_separator_positions(prompt_tokens)
+            ValueError: 格式错误
+            RuntimeError: 解析失败
 
-        if not sep_positions:
+        性能:
+            - 使用滑动窗口匹配: O(n * m)
+            - n = len(tokens), m = len(separator)
+        """
+        # 转换为torch.Tensor
+        if isinstance(prompt_tokens, list):
+            tokens = torch.tensor(
+                prompt_tokens,
+                dtype=torch.long,
+                device=self.sep_tokens.device,
+            )
+        else:
+            tokens = prompt_tokens.to(
+                device=self.sep_tokens.device,
+                dtype=torch.long,
+            )
+
+        # 使用滑动窗口快速匹配分隔符
+        token_chunks = list(self._fast_split_by_subtensor(tokens))
+
+        if not token_chunks:
             raise ValueError(
                 f"No separator '{self.separator}' found in prompt"
             )
 
         # 解析各部分
-        sys_prompt = prompt_tokens[:sep_positions[0]]
+        # token_chunks[0]: sys_prompt (第一个分隔符之前)
+        # token_chunks[1:]: chunks (分隔符之间的内容)
+        sys_prompt = token_chunks[0].cpu().tolist()
+
         chunks = []
-        for i in range(len(sep_positions) - 1):
-            start = sep_positions[i] + len(self.separator_tokens)
-            end = sep_positions[i + 1]
-            chunk = prompt_tokens[start:end]
+        for i in range(1, len(token_chunks)):
+            chunk = token_chunks[i].cpu().tolist()
             if not chunk:
-                raise ValueError(f"Empty chunk between separators {i} and {i+1}")
+                raise ValueError(
+                    f"Empty chunk after separator {i}. "
+                    f"Separators should not be adjacent."
+                )
             chunks.append(chunk)
 
-        # 解析question (最后一个分隔符之后)
-        last_sep_end = sep_positions[-1] + len(self.separator_tokens)
-        user_question = prompt_tokens[last_sep_end:]
+        # 最后一个chunk是user_question
+        # 但根据我们的格式，user_question在最后一个分隔符之后
+        # 所以我们需要调整解析逻辑
+
+        # 重新解析: 查找所有分隔符位置
+        sep_positions = self._find_separator_positions(tokens)
+
+        # 解析: sys_prompt (第一个分隔符之前)
+        sys_prompt = tokens[:sep_positions[0]].cpu().tolist()
+
+        # 解析: chunks (分隔符之间)
+        chunks = []
+        for i in range(len(sep_positions) - 1):
+            start = sep_positions[i] + self.sep_len
+            end = sep_positions[i + 1]
+            chunk = tokens[start:end].cpu().tolist()
+            if not chunk:
+                raise ValueError(
+                    f"Empty chunk between separators {i} and {i+1}. "
+                    f"Separators should not be adjacent."
+                )
+            chunks.append(chunk)
+
+        # 解析: question (最后一个分隔符之后)
+        last_sep_end = sep_positions[-1] + self.sep_len
+        if last_sep_end < len(tokens):
+            user_question = tokens[last_sep_end:].cpu().tolist()
+        else:
+            raise ValueError("Empty user_question after last separator")
 
         return ChunkedPrompt(
             sys_prompt=sys_prompt,
@@ -1131,19 +1239,113 @@ class ChunkedPromptParser:
             separator=self.separator,
         )
 
+    def _fast_split_by_subtensor(
+        self,
+        tokens: torch.Tensor,
+    ) -> List[torch.Tensor]:
+        """
+        使用滑动窗口快速匹配分隔符
+
+        参考 LMcache SegmentTokenDatabase._fast_split_by_subtensor
+        时间复杂度: O((n-m+1) * m) where n=len(tokens), m=len(separator)
+
+        Args:
+            tokens: token张量
+
+        Yields:
+            分割后的token张量
+        """
+        if self.sep_len == 0 or len(tokens) < self.sep_len:
+            yield tokens
+            return
+
+        # Unfold into sliding windows
+        # shape: (num_tokens-sep_len+1, sep_len)
+        windows = tokens.unfold(0, self.sep_len, 1)
+
+        # Compare each window with sep_tokens
+        matches = (
+            (windows == self.sep_tokens)
+            .all(dim=1)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
+
+        # Split based on matches
+        start = 0
+        for idx in matches:
+            yield tokens[start:idx]
+            start = idx + self.sep_len
+
+        # Yield last chunk
+        yield tokens[start:]
+
     def _find_separator_positions(
         self,
-        tokens: List[int],
+        tokens: torch.Tensor,
     ) -> List[int]:
-        """查找所有分隔符的起始位置"""
-        positions = []
-        sep_len = len(self.separator_tokens)
+        """
+        查找所有分隔符的起始位置
 
-        for i in range(len(tokens) - sep_len + 1):
-            if tokens[i:i + sep_len] == self.separator_tokens:
-                positions.append(i)
+        Returns:
+            List[int]: 分隔符起始位置列表
+        """
+        if self.sep_len == 0 or len(tokens) < self.sep_len:
+            return []
 
-        return positions
+        # Unfold into sliding windows
+        windows = tokens.unfold(0, self.sep_len, 1)
+
+        # Compare each window with sep_tokens
+        matches = (
+            (windows == self.sep_tokens)
+            .all(dim=1)
+            .nonzero(as_tuple=True)[0]
+            .tolist()
+        )
+
+        return matches
+
+    def validate_and_parse(
+        self,
+        prompt_str: str,
+    ) -> ChunkedPrompt:
+        """
+        验证并解析提示词 (带字符串验证)
+
+        Args:
+            prompt_str: 原始提示词字符串
+
+        Returns:
+            ChunkedPrompt: 解析后的结构
+
+        Raises:
+            ValueError: 格式验证失败
+        """
+        # 验证分隔符存在
+        if self.separator not in prompt_str:
+            raise ValueError(
+                f"Separator '{self.separator}' not found in prompt"
+            )
+
+        # 验证分隔符数量 (至少需要1个分隔sys_prompt和chunks)
+        sep_count = prompt_str.count(self.separator)
+        if sep_count < 1:
+            raise ValueError(
+                f"Need at least 1 separator (found {sep_count}). "
+                f"Format: sys_prompt{self.separator}chunks{self.separator}question"
+            )
+
+        # Tokenize
+        tokens = self.tokenizer.encode(prompt_str, add_special_tokens=False)
+        tokens_tensor = torch.tensor(
+            tokens,
+            dtype=torch.long,
+            device=self.sep_tokens.device,
+        )
+
+        # 解析
+        return self.parse(tokens_tensor, prompt_str)
 
 
 class GPUModelRunner:
@@ -1151,10 +1353,10 @@ class GPUModelRunner:
     GPU模型运行器 - Chunk缓存扩展
 
     新增方法:
+    - set_chunk_cache_manager(): 注入ChunkCacheManager
     - parse_chunked_prompt(): 解析分块提示词
     - get_or_compute_chunks(): 获取或计算所有chunks
     - compute_chunk_kv(): 在指定位置计算chunk KV
-    - set_chunk_cache_manager(): 注入ChunkCacheManager
     """
 
     def __init__(self, *args, **kwargs):
@@ -1165,7 +1367,10 @@ class GPUModelRunner:
         self.chunk_cache_manager: Optional[ChunkCacheManager] = None
         self.chunk_parser: Optional[ChunkedPromptParser] = None
 
-    def set_chunk_cache_manager(self, manager: ChunkCacheManager):
+    def set_chunk_cache_manager(
+        self,
+        manager: ChunkCacheManager,
+    ):
         """
         注入ChunkCacheManager (由LLMEngine调用)
 
@@ -1176,18 +1381,19 @@ class GPUModelRunner:
         self.chunk_parser = ChunkedPromptParser(
             self.tokenizer,
             manager.config.chunk_separator,
+            device=self.device,
         )
 
     def parse_chunked_prompt(
         self,
-        prompt_tokens: List[int],
+        prompt_tokens: Union[torch.Tensor, List[int]],
         prompt_str: Optional[str] = None,
     ) -> ChunkedPrompt:
         """
         解析分块提示词
 
         Args:
-            prompt_tokens: token序列
+            prompt_tokens: token序列 (torch.Tensor或List[int])
             prompt_str: 原始字符串 (可选)
 
         Returns:
@@ -1198,7 +1404,10 @@ class GPUModelRunner:
             RuntimeError: chunk_parser未初始化
         """
         if self.chunk_parser is None:
-            raise RuntimeError("ChunkParser not initialized")
+            raise RuntimeError(
+                "ChunkParser not initialized. "
+                "Call set_chunk_cache_manager() first."
+            )
 
         return self.chunk_parser.parse(prompt_tokens, prompt_str)
 
@@ -1220,7 +1429,10 @@ class GPUModelRunner:
             MemoryError: 内存不足
         """
         if self.chunk_cache_manager is None:
-            raise RuntimeError("ChunkCacheManager not initialized")
+            raise RuntimeError(
+                "ChunkCacheManager not initialized. "
+                "Call set_chunk_cache_manager() first."
+            )
 
         remapped_kvs = []
         current_position = 0
