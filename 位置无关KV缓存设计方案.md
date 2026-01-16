@@ -541,50 +541,799 @@ class VllmConfig:
 ### 4.1 ChunkCacheManager
 
 ```python
+from typing import List, Dict, Optional, TYPE_CHECKING
+from dataclasses import dataclass, field
+import threading
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+@dataclass
+class ChunkCacheStats:
+    """缓存统计信息"""
+    total_chunks: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+    total_tokens_cached: int = 0
+    evicted_chunks: int = 0
+    current_memory_mb: float = 0.0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.cache_hits + self.cache_misses
+        return self.cache_hits / total if total > 0 else 0.0
+
+
 class ChunkCacheManager:
+    """
+    Chunk缓存管理器 - 核心接口
+
+    职责:
+    - 协调ChunkHashIndex和ChunkBlockPool
+    - 提供chunk获取/计算/缓存功能
+    - LRU淘汰管理
+    - 统计信息收集
+    """
+
+    def __init__(
+        self,
+        config: ChunkCacheConfig,
+        kv_cache_spec: KVCacheSpec,
+        block_size: int,
+        ascend_allocator: Optional[CaMemAllocator] = None,
+    ):
+        """
+        初始化ChunkCacheManager
+
+        Args:
+            config: Chunk缓存配置
+            kv_cache_spec: KV缓存规格 {num_kv_heads, head_dim, dtype}
+            block_size: 块大小 (tokens per block)
+            ascend_allocator: 昇腾内存分配器 (可选)
+
+        Raises:
+            ValueError: 配置参数无效
+        """
+        self.config = config
+        self.block_size = block_size
+        self.kv_cache_spec = kv_cache_spec
+
+        # 初始化子模块
+        self.chunk_hash_index = ChunkHashIndex(
+            hash_algo=config.chunk_hash_algo
+        )
+        self.chunk_block_pool = ChunkBlockPool(
+            num_blocks=config.max_chunks,
+            block_size=block_size,
+            ascend_allocator=ascend_allocator,
+        )
+        self.position_remapper = PositionRemapper(
+            block_pool=self.chunk_block_pool,
+            kv_cache_spec=kv_cache_spec,
+            device="npu",
+        )
+
+        # 统计信息 (线程安全)
+        self._stats = ChunkCacheStats()
+        self._lock = threading.Lock()
+
+        # 虚拟位置范围
+        self._virtual_pos_start = 0
+        self._max_chunk_len = config.max_chunk_tokens
+
     def get_or_compute_chunk(
-        self, chunk_tokens, position_offset, model_runner
-    ) -> RemappedChunkKV
-        """获取或计算 chunk KV cache"""
+        self,
+        chunk_tokens: List[int],
+        position_offset: int,
+        model_runner: "GPUModelRunner",
+    ) -> RemappedChunkKV:
+        """
+        获取或计算chunk KV cache (核心方法)
 
-    def get_stats(self) -> Dict
-        """获取缓存统计信息"""
+        Args:
+            chunk_tokens: chunk的token序列
+            position_offset: 目标位置偏移
+            model_runner: 模型运行器引用
 
-    def clear(self)
-        """清空缓存"""
+        Returns:
+            RemappedChunkKV: 重映射后的chunk KV (在主KV池中)
+
+        Raises:
+            ValueError: chunk_tokens为空
+            MemoryError: 内存不足 (即使LRU淘汰后)
+            RuntimeError: model_runner未初始化
+
+        时间复杂度:
+            缓存命中: O(1) + O(n) 拷贝重映射
+            缓存未命中: O(n) 计算 + O(n) 拷贝重映射
+        """
+        if not chunk_tokens:
+            raise ValueError("chunk_tokens cannot be empty")
+
+        num_tokens = len(chunk_tokens)
+        required_blocks = (num_tokens + self.block_size - 1) // self.block_size
+
+        # Step 1: 计算内容哈希
+        chunk_hash = self.chunk_hash_index.compute_hash(
+            chunk_tokens,
+            self.block_size,
+        )
+
+        # Step 2: 查找缓存
+        cached_chunk = self.chunk_hash_index.lookup(chunk_hash)
+
+        if cached_chunk is not None:
+            # 缓存命中
+            with self._lock:
+                self._stats.cache_hits += 1
+
+            cached_chunk.touch()
+            return self.position_remapper.remap_and_copy(
+                cached_chunk,
+                position_offset,
+            )
+
+        # 缓存未命中
+        with self._lock:
+            self._stats.cache_misses += 1
+
+        # Step 3: 检查并淘汰LRU
+        try:
+            self.chunk_block_pool.evict_lru_until_enough(required_blocks)
+        except MemoryError as e:
+            # 淘汰后仍不足
+            raise MemoryError(
+                f"Insufficient memory for chunk ({num_tokens} tokens). "
+                f"Required: {required_blocks} blocks"
+            ) from e
+
+        # Step 4: 在虚拟位置计算KV
+        virtual_position = self._get_virtual_position(num_tokens)
+        computed_kv = self._compute_chunk_kv_at_position(
+            model_runner,
+            chunk_tokens,
+            virtual_position,
+        )
+
+        # Step 5: 存储到chunk池
+        self.chunk_hash_index.insert(chunk_hash, computed_kv)
+
+        with self._lock:
+            self._stats.total_chunks += 1
+            self._stats.total_tokens_cached += num_tokens
+
+        # Step 6: 拷贝重映射到目标位置
+        return self.position_remapper.remap_and_copy(
+            computed_kv,
+            position_offset,
+        )
+
+    def _compute_chunk_kv_at_position(
+        self,
+        model_runner: "GPUModelRunner",
+        tokens: List[int],
+        position: int,
+    ) -> ChunkKVCache:
+        """
+        在指定位置计算chunk KV
+
+        Args:
+            model_runner: 模型运行器
+            tokens: token序列
+            position: 起始位置
+
+        Returns:
+            ChunkKVCache: 计算得到的chunk KV (在虚拟位置)
+
+        Raises:
+            RuntimeError: 模型执行失败
+        """
+        try:
+            return model_runner.compute_chunk_kv(
+                tokens=tokens,
+                position=position,
+                block_pool=self.chunk_block_pool,
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to compute chunk KV: {e}") from e
+
+    def _get_virtual_position(self, num_tokens: int) -> int:
+        """获取虚拟位置 (所有chunk共享相同范围)"""
+        if num_tokens > self._max_chunk_len:
+            raise ValueError(
+                f"Chunk size {num_tokens} exceeds max {self._max_chunk_len}"
+            )
+        return self._virtual_pos_start
+
+    def get_stats(self) -> ChunkCacheStats:
+        """
+        获取缓存统计信息
+
+        Returns:
+            ChunkCacheStats: 统计信息副本 (线程安全)
+        """
+        with self._lock:
+            return ChunkCacheStats(
+                total_chunks=self._stats.total_chunks,
+                cache_hits=self._stats.cache_hits,
+                cache_misses=self._stats.cache_misses,
+                total_tokens_cached=self._stats.total_tokens_cached,
+                evicted_chunks=self._stats.evicted_chunks,
+                current_memory_mb=self.chunk_block_pool.get_memory_usage_mb(),
+            )
+
+    def clear(self):
+        """
+        清空所有缓存 (测试用)
+
+        线程安全: 使用锁保护
+        """
+        with self._lock:
+            self.chunk_hash_index.clear()
+            self.chunk_block_pool.reset()
+            self._stats = ChunkCacheStats()
+
+    def cleanup_remapped_blocks(
+        self,
+        block_ids: List[int],
+    ):
+        """
+        清理重映射使用的块 (请求结束后调用)
+
+        Args:
+            block_ids: 要释放的块ID列表 (主KV池)
+        """
+        self.position_remapper.release_remapped_blocks(block_ids)
 ```
 
 ### 4.2 PositionRemapper
 
 ```python
-class PositionRemapper:
-    def remap_and_copy(
-        self, chunk_kv_cache, new_position_offset
-    ) -> RemappedChunkKV
-        """拷贝并重映射 chunk KV"""
+import torch
+import torch.nn.functional as F
+from typing import List, Tuple, TYPE_CHECKING
 
-    def release_remapped_blocks(self, block_ids)
-        """释放重映射块 (请求结束后)"""
+if TYPE_CHECKING:
+    from vllm.v1.core.chunk_block_pool import ChunkBlockPool
+
+
+class PositionRemapper:
+    """
+    位置重映射器 - KV拷贝和RoPE重新编码
+
+    职责:
+    - 分配主KV池的物理块
+    - 拷贝KV数据并应用新位置的RoPE编码
+    - 管理重映射块的生命周期
+    """
+
+    def __init__(
+        self,
+        block_pool: ChunkBlockPool,
+        kv_cache_spec: KVCacheSpec,
+        device: torch.device,
+    ):
+        """
+        初始化
+
+        Args:
+            block_pool: Chunk块池 (用于分配)
+            kv_cache_spec: KV缓存规格
+            device: 设备 (npu或cuda)
+        """
+        self.block_pool = block_pool
+        self.kv_cache_spec = kv_cache_spec
+        self.device = device
+        self.num_kv_heads = kv_cache_spec.num_kv_heads
+        self.head_dim = kv_cache_spec.head_dim
+        self.dtype = kv_cache_spec.dtype
+
+        # RoPE缓存 (位置 -> cos/sin)
+        self._rope_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def remap_and_copy(
+        self,
+        chunk_kv_cache: ChunkKVCache,
+        new_position_offset: int,
+    ) -> RemappedChunkKV:
+        """
+        拷贝并重映射chunk KV cache
+
+        Args:
+            chunk_kv_cache: 缓存的chunk KV (在chunk池中)
+            new_position_offset: 新的位置偏移
+
+        Returns:
+            RemappedChunkKV: 重映射后的KV (在主KV池中)
+
+        Raises:
+            MemoryError: 主KV池内存不足
+            RuntimeError: NPU拷贝失败
+
+        时间复杂度: O(num_tokens)
+        空间复杂度: O(num_tokens) (新分配blocks)
+        """
+        num_tokens = chunk_kv_cache.num_tokens
+        num_blocks = len(chunk_kv_cache.block_ids)
+
+        # Step 1: 从主KV池分配块
+        try:
+            new_block_ids = self._allocate_from_main_pool(num_blocks)
+        except MemoryError as e:
+            raise MemoryError(
+                f"Failed to allocate {num_blocks} blocks for remapped KV"
+            ) from e
+
+        # Step 2: 计算新位置序列
+        new_positions = torch.arange(
+            new_position_offset,
+            new_position_offset + num_tokens,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        # Step 3: 获取或计算RoPE编码
+        try:
+            cos, sin = self._get_or_compute_rope(new_positions)
+        except Exception as e:
+            # 清理已分配的块
+            self._free_to_main_pool(new_block_ids)
+            raise RuntimeError(f"Failed to compute RoPE: {e}") from e
+
+        # Step 4: 拷贝KV并应用RoPE
+        try:
+            remapped_k, remapped_v = self._copy_and_apply_rope(
+                src_k=chunk_kv_cache.key_cache,
+                src_v=chunk_kv_cache.value_cache,
+                src_blocks=chunk_kv_cache.block_ids,
+                dst_blocks=new_block_ids,
+                cos=cos,
+                sin=sin,
+                positions=new_positions,
+            )
+        except Exception as e:
+            # 清理已分配的块
+            self._free_to_main_pool(new_block_ids)
+            raise RuntimeError(f"Failed to copy KV: {e}") from e
+
+        # Step 5: 创建重映射后的KV
+        return RemappedChunkKV(
+            block_ids=new_block_ids,
+            key_cache=remapped_k,
+            value_cache=remapped_v,
+            position_start=new_position_offset,
+            position_end=new_position_offset + num_tokens,
+            positions=new_positions,
+            num_tokens=num_tokens,
+            chunk_hash=chunk_kv_cache.chunk_hash,
+            source_cache_ref=chunk_kv_cache,
+        )
+
+    def _allocate_from_main_pool(self, num_blocks: int) -> List[int]:
+        """
+        从主KV池分配块
+
+        注意: 这里需要访问vLLM的主KV分配器
+        实际实现中需要注入主KV池的引用
+        """
+        # TODO: 注入主KV池分配器
+        # 这里暂时使用简化的分配逻辑
+        main_kv_pool = self._get_main_kv_pool()
+        return main_kv_pool.allocate(num_blocks)
+
+    def _free_to_main_pool(self, block_ids: List[int]):
+        """释放块到主KV池"""
+        main_kv_pool = self._get_main_kv_pool()
+        main_kv_pool.free(block_ids)
+
+    def _get_main_kv_pool(self):
+        """获取主KV池 (需要注入)"""
+        # TODO: 实现主KV池注入
+        raise NotImplementedError("Main KV pool injection required")
+
+    def _get_or_compute_rope(
+        self,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        获取或计算RoPE编码 (带缓存)
+
+        Args:
+            positions: 位置张量 [num_tokens]
+
+        Returns:
+            (cos, sin): RoPE编码 [num_tokens, head_dim]
+        """
+        # 使用位置范围作为缓存key
+        pos_start = positions[0].item()
+        pos_end = positions[-1].item() + 1
+        cache_key = (pos_start, pos_end)
+
+        if cache_key in self._rope_cache:
+            return self._rope_cache[cache_key]
+
+        # 计算RoPE
+        cos, sin = self._compute_rope_for_positions(positions)
+
+        # 缓存
+        self._rope_cache[cache_key] = (cos, sin)
+
+        return cos, sin
+
+    def _compute_rope_for_positions(
+        self,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        计算指定位置的RoPE编码
+
+        Args:
+            positions: 位置张量 [num_tokens]
+
+        Returns:
+            (cos, sin): RoPE编码 [num_tokens, head_dim]
+        """
+        # 实现RoPE计算逻辑
+        # 这里简化处理，实际需要根据模型配置
+        inv_freq = self._get_rope_inv_freq()
+        t = positions.float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos().to(dtype=self.dtype)
+        sin = emb.sin().to(dtype=self.dtype)
+        return cos, sin
+
+    def _get_rope_inv_freq(self) -> torch.Tensor:
+        """获取RoPE逆频率 (根据模型配置)"""
+        # TODO: 从模型配置获取
+        base = 10000.0
+        dims = self.head_dim
+        inv_freq = 1.0 / (base ** (torch.arange(0, dims, 2).float() / dims))
+        return inv_freq.to(device=self.device)
+
+    def _copy_and_apply_rope(
+        self,
+        src_k: torch.Tensor,
+        src_v: torch.Tensor,
+        src_blocks: List[int],
+        dst_blocks: List[int],
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        拷贝KV数据并应用RoPE编码
+
+        使用昇腾NPU优化: torch_npu.npu_kv_rmsnorm_rope_cache()
+
+        Args:
+            src_k: 源K cache
+            src_v: 源V cache
+            src_blocks: 源块ID列表
+            dst_blocks: 目标块ID列表
+            cos: RoPE cos编码
+            sin: RoPE sin编码
+            positions: 位置张量
+
+        Returns:
+            (dst_k, dst_v): 重映射后的KV
+        """
+        import torch_npu
+
+        # 准备目标KV
+        dst_k = torch.empty_like(src_k)
+        dst_v = torch.empty_like(src_v)
+
+        # 使用NPU kernel拷贝并应用RoPE
+        for src_bid, dst_bid in zip(src_blocks, dst_blocks):
+            try:
+                dst_k[dst_bid], dst_v[dst_bid] = torch_npu.npu_kv_rmsnorm_rope_cache(
+                    kv_input=None,
+                    gamma=None,
+                    cos=cos,
+                    sin=sin,
+                    positions=positions,
+                    key_cache=src_k,
+                    value_cache=src_v,
+                    block_table=torch.tensor([src_bid], device=self.device),
+                    cache_mode="PA",
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"NPU KV copy failed for block {src_bid}->{dst_bid}: {e}"
+                ) from e
+
+        return dst_k, dst_v
+
+    def release_remapped_blocks(self, block_ids: List[int]):
+        """
+        释放重映射使用的物理块 (请求结束后)
+
+        Args:
+            block_ids: 要释放的块ID列表
+        """
+        self._free_to_main_pool(block_ids)
 ```
 
 ### 4.3 GPUModelRunner
 
 ```python
+from typing import List, Optional, TYPE_CHECKING
+from abc import abstractmethod
+
+if TYPE_CHECKING:
+    from vllm.v1.core.chunk_cache_manager import ChunkCacheManager
+
+
+class ChunkedPromptParser:
+    """分块提示词解析器"""
+
+    def __init__(self, tokenizer, separator: str = "##"):
+        """
+        初始化
+
+        Args:
+            tokenizer: 分词器
+            separator: 分隔符字符串
+        """
+        self.tokenizer = tokenizer
+        self.separator = separator
+        self.separator_tokens = tokenizer.encode(
+            separator,
+            add_special_tokens=False,
+        )
+
+    def parse(
+        self,
+        prompt_tokens: List[int],
+        prompt_str: Optional[str] = None,
+    ) -> ChunkedPrompt:
+        """
+        解析分块提示词
+
+        Args:
+            prompt_tokens: token序列
+            prompt_str: 原始字符串 (可选，用于验证)
+
+        Returns:
+            ChunkedPrompt: 解析后的分块结构
+
+        Raises:
+            ValueError: 格式错误 (无分隔符、空chunk等)
+        """
+        # 查找所有分隔符位置
+        sep_positions = self._find_separator_positions(prompt_tokens)
+
+        if not sep_positions:
+            raise ValueError(
+                f"No separator '{self.separator}' found in prompt"
+            )
+
+        # 解析各部分
+        sys_prompt = prompt_tokens[:sep_positions[0]]
+        chunks = []
+        for i in range(len(sep_positions) - 1):
+            start = sep_positions[i] + len(self.separator_tokens)
+            end = sep_positions[i + 1]
+            chunk = prompt_tokens[start:end]
+            if not chunk:
+                raise ValueError(f"Empty chunk between separators {i} and {i+1}")
+            chunks.append(chunk)
+
+        # 解析question (最后一个分隔符之后)
+        last_sep_end = sep_positions[-1] + len(self.separator_tokens)
+        user_question = prompt_tokens[last_sep_end:]
+
+        return ChunkedPrompt(
+            sys_prompt=sys_prompt,
+            chunks=chunks,
+            user_question=user_question,
+            separator=self.separator,
+        )
+
+    def _find_separator_positions(
+        self,
+        tokens: List[int],
+    ) -> List[int]:
+        """查找所有分隔符的起始位置"""
+        positions = []
+        sep_len = len(self.separator_tokens)
+
+        for i in range(len(tokens) - sep_len + 1):
+            if tokens[i:i + sep_len] == self.separator_tokens:
+                positions.append(i)
+
+        return positions
+
+
 class GPUModelRunner:
+    """
+    GPU模型运行器 - Chunk缓存扩展
+
+    新增方法:
+    - parse_chunked_prompt(): 解析分块提示词
+    - get_or_compute_chunks(): 获取或计算所有chunks
+    - compute_chunk_kv(): 在指定位置计算chunk KV
+    - set_chunk_cache_manager(): 注入ChunkCacheManager
+    """
+
+    def __init__(self, *args, **kwargs):
+        # 现有初始化
+        super().__init__(*args, **kwargs)
+
+        # 新增: Chunk缓存相关
+        self.chunk_cache_manager: Optional[ChunkCacheManager] = None
+        self.chunk_parser: Optional[ChunkedPromptParser] = None
+
+    def set_chunk_cache_manager(self, manager: ChunkCacheManager):
+        """
+        注入ChunkCacheManager (由LLMEngine调用)
+
+        Args:
+            manager: Chunk缓存管理器实例
+        """
+        self.chunk_cache_manager = manager
+        self.chunk_parser = ChunkedPromptParser(
+            self.tokenizer,
+            manager.config.chunk_separator,
+        )
+
     def parse_chunked_prompt(
-        self, prompt_tokens, separator
-    ) -> ChunkedPrompt
-        """解析分块提示词"""
+        self,
+        prompt_tokens: List[int],
+        prompt_str: Optional[str] = None,
+    ) -> ChunkedPrompt:
+        """
+        解析分块提示词
+
+        Args:
+            prompt_tokens: token序列
+            prompt_str: 原始字符串 (可选)
+
+        Returns:
+            ChunkedPrompt: 解析后的分块结构
+
+        Raises:
+            ValueError: 格式错误
+            RuntimeError: chunk_parser未初始化
+        """
+        if self.chunk_parser is None:
+            raise RuntimeError("ChunkParser not initialized")
+
+        return self.chunk_parser.parse(prompt_tokens, prompt_str)
 
     def get_or_compute_chunks(
-        self, chunked_prompt
-    ) -> List[RemappedChunkKV]
-        """获取或计算所有 chunks"""
+        self,
+        chunked_prompt: ChunkedPrompt,
+    ) -> List[RemappedChunkKV]:
+        """
+        获取或计算所有chunks的KV cache (包括sys_prompt)
+
+        Args:
+            chunked_prompt: 解析后的分块提示词
+
+        Returns:
+            List[RemappedChunkKV]: 所有chunk的重映射KV
+
+        Raises:
+            RuntimeError: ChunkCacheManager未初始化
+            MemoryError: 内存不足
+        """
+        if self.chunk_cache_manager is None:
+            raise RuntimeError("ChunkCacheManager not initialized")
+
+        remapped_kvs = []
+        current_position = 0
+
+        # 处理所有chunks (包括sys_prompt)
+        all_chunks = chunked_prompt.get_all_chunks()
+
+        for chunk_tokens in all_chunks:
+            try:
+                remapped_kv = self.chunk_cache_manager.get_or_compute_chunk(
+                    chunk_tokens=chunk_tokens,
+                    position_offset=current_position,
+                    model_runner=self,
+                )
+            except Exception as e:
+                # 清理已分配的KV
+                for kv in remapped_kvs:
+                    self.chunk_cache_manager.cleanup_remapped_blocks(
+                        kv.block_ids
+                    )
+                raise RuntimeError(
+                    f"Failed to get_or_compute chunk at position {current_position}: {e}"
+                ) from e
+
+            remapped_kvs.append(remapped_kv)
+            current_position += len(chunk_tokens)
+
+        return remapped_kvs
 
     def compute_chunk_kv(
-        self, tokens, position
-    ) -> ChunkKVCache
-        """在指定位置计算 chunk KV"""
+        self,
+        tokens: List[int],
+        position: int,
+        block_pool: "ChunkBlockPool",
+    ) -> ChunkKVCache:
+        """
+        在指定位置计算chunk KV
+
+        Args:
+            tokens: token序列
+            position: 起始位置
+            block_pool: 块池 (用于分配)
+
+        Returns:
+            ChunkKVCache: 计算得到的chunk KV
+
+        Raises:
+            RuntimeError: 模型执行失败
+            MemoryError: 块池内存不足
+        """
+        # 分配块
+        num_tokens = len(tokens)
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+
+        try:
+            block_ids = block_pool.allocate_blocks(num_blocks)
+        except MemoryError as e:
+            raise MemoryError(
+                f"Failed to allocate {num_blocks} blocks for chunk"
+            ) from e
+
+        # 准备输入
+        input_ids = torch.tensor([tokens], device=self.device)
+        positions = torch.arange(
+            position,
+            position + num_tokens,
+            device=self.device,
+        )
+
+        # 执行模型
+        try:
+            with torch.no_grad():
+                # 调用模型前向传播
+                outputs = self.model.forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    kv_cache=(None, None),  # 初始为空
+                )
+        except Exception as e:
+            # 清理已分配的块
+            block_pool.free_blocks(block_ids)
+            raise RuntimeError(f"Model execution failed: {e}") from e
+
+        # 提取KV
+        key_cache = outputs.key_cache  # [1, num_tokens, num_kv_heads, head_dim]
+        value_cache = outputs.value_cache
+
+        # 存储到块中
+        for i, block_id in enumerate(block_ids):
+            start_idx = i * self.block_size
+            end_idx = min(start_idx + self.block_size, num_tokens)
+
+            self.key_cache[block_id] = key_cache[:, start_idx:end_idx]
+            self.value_cache[block_id] = value_cache[:, start_idx:end_idx]
+
+        # 计算hash
+        from vllm.v1.core.chunk_hash_index import ChunkHashIndex
+        chunk_hash = ChunkHashIndex.compute_hash(tokens, self.block_size)
+
+        return ChunkKVCache(
+            chunk_hash=chunk_hash,
+            num_tokens=num_tokens,
+            block_ids=block_ids,
+            block_size=self.block_size,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
+            virtual_position_start=position,
+            virtual_position_end=position + num_tokens,
+            created_at=time.time(),
+            last_accessed=time.time(),
+            access_count=1,
+            ref_count=0,
+        )
 ```
 
 ---
