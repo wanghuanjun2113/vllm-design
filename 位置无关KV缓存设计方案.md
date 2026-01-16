@@ -66,71 +66,99 @@ sys_prompt + "##" + chunk1 + "##" + chunk2 + "##" + user_question
 
 ## 2. 系统架构
 
-### 2.1 整体架构
+### 2.1 整体架构 (参考LMCache分层设计)
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    LLMEngine (vllm/v1/engine/)                │
+│                                                                │
+│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────┐  │
+│  │InputProcessor│→ │ ChunkCacheEngine │→ │EngineCoreClient│  │
+│  │              │  │    (新增)        │  │                │  │
+│  │ chunk解析    │  │ 缓存管理层       │  │ 调度执行       │  │
+│  └──────────────┘  └────────┬─────────┘  └────────────────┘  │
+│                             ↓                                  │
+│  ┌────────────────────────────────────────────────────────┐   │
+│  │          Worker (vllm/v1/worker/)                      │   │
+│  │                                                         │   │
+│  │  GPUModelRunner (修改)                                 │   │
+│  │  - 新增: parse_chunked_prompt()                        │   │
+│  │  - 新增: get_or_compute_chunks()                       │   │
+│  │  - 调用: ChunkCacheEngine.lookup()/store()             │   │
+│  └────────────────────────────────────────────────────────┘   │
+└───────────────────────────────────────────────────────────────┘
+```
+
+**分层架构设计**:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     LLMEngine (vllm/v1/engine/)             │
-│                                                              │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
-│  │InputProcessor│→ │ ChunkCache   │→ │ EngineCoreClient │  │
-│  │              │  │   Manager    │  │                  │  │
-│  │ 解析chunked  │  │ (新增)       │  │ 调度执行         │  │
-│  │ prompt       │  │              │  │                  │  │
-│  └──────────────┘  └──────┬───────┘  └──────────────────┘  │
-│                            ↓                                 │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │           Worker (vllm/v1/worker/)                   │  │
-│  │                                                       │  │
-│  │  GPUModelRunner (修改)                               │  │
-│  │  - 新增: parse_chunked_prompt()                      │  │
-│  │  - 新增: get_or_compute_chunks()                     │  │
-│  │  - 调用: ChunkCacheManager.get_or_compute_chunk()    │  │
-│  └──────────────────────────────────────────────────────┘  │
+│                    ENGINE LAYER                             │
+│  ┌──────────────────┐      ┌──────────────────┐            │
+│  │ ChunkCacheEngine  │ ───→ │ ChunkTokenParser │            │
+│  │  (缓存引擎)       │      │  (分词解析)       │            │
+│  │ - lookup()        │      │ - parse()        │            │
+│  │ - store()         │      │ - validate()     │            │
+│  │ - clear()         │      │                  │            │
+│  └────────┬─────────┘      └──────────────────┘            │
+│           ↓                                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │          STORAGE LAYER (存储层)                      │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │    │
+│  │  │ ChunkHash    │  │ ChunkStorage │  │ ChunkLRU │  │    │
+│  │  │ Index        │  │ Manager      │  │ Policy   │  │    │
+│  │  │ (哈希索引)   │  │ (存储管理)    │  │ (淘汰策略)│  │    │
+│  │  │ - lookup()   │  │ - allocate() │  │ - evict() │  │    │
+│  │  │ - insert()   │  │ - free()     │  │           │  │    │
+│  │  └──────────────┘  └──────────────┘  └───────────┘  │    │
+│  └─────────────────────────────────────────────────────┘    │
+│           ↓                                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │          ADAPTER LAYER (适配层)                      │    │
+│  │  ┌──────────────┐  ┌──────────────┐                 │    │
+│  │  │ ChunkKV      │  │ Position     │                 │    │
+│  │  │ Connector    │  │ Remapper     │                 │    │
+│  │  │ (GPU↔CPU)    │  │ (位置重映射)   │                 │    │
+│  │  │ - to_cpu()   │  │ - remap()    │                 │    │
+│  │  │ - to_gpu()   │  │ - copy()     │                 │    │
+│  │  └──────────────┘  └──────────────┘                 │    │
+│  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 分层架构
+### 2.2 核心组件职责
 
-```
-API Layer (entrypoints)
-    ↓
-ENGINE LAYER (vllm/v1/engine/)
-    - InputProcessor: 解析 chunked prompt
-    - LLMEngine: 初始化 ChunkCacheManager
-    - ChunkCacheManager: 管理缓存
-    ↓
-WORKER LAYER (vllm/v1/worker/)
-    - GPUModelRunner: 获取/计算 chunks
-    - PositionRemapper: KV 拷贝重映射
-    ↓
-CORE LAYER (vllm/v1/core/)
-    - ChunkHashIndex: 哈希索引
-    - ChunkBlockPool: 块池管理
-    - Chunk Structures: 数据结构
-    ↓
-ATTENTION LAYER (vllm-ascend/attention/)
-    - AscendSFABackend: SFA attention
-    - AttentionMaskBuilder: chunk-aware mask
-```
+**设计原则**: 参考 LMCache 的分层架构，实现职责分离
 
-### 2.3 新增/修改模块
+| 层级 | 组件 | 职责 | 参考LMCache |
+|------|------|------|-------------|
+| **Engine层** | ChunkCacheEngine | 协调各组件，提供统一API | LMCacheEngine |
+| **Token层** | ChunkTokenParser | 解析chunked prompt，识别chunks | TokenDatabase |
+| **存储层** | ChunkStorageManager | 管理存储后端，分配/释放内存 | StorageManager |
+| **索引层** | ChunkHashIndex | 内容哈希 → chunk 映射 | 内嵌在StorageManager |
+| **淘汰层** | ChunkLRUPolicy | LRU淘汰策略 | cache_policy/lru.py |
+| **适配层** | ChunkKVConnector | GPU↔CPU数据传输 | GPUConnector |
+| **重映射层** | PositionRemapper | KV拷贝+RoPE重新编码 | 特有功能 |
 
-**新增模块** (6个):
+### 2.3 新增/修改模块清单
+
+**新增模块** (7个):
+- `vllm/v1/core/chunk_cache_engine.py` - 缓存引擎 (协调层)
+- `vllm/v1/core/chunk_token_parser.py` - Token解析器
+- `vllm/v1/core/chunk_storage_manager.py` - 存储管理器
 - `vllm/v1/core/chunk_hash_index.py` - 哈希索引
-- `vllm/v1/core/chunk_block_pool.py` - 块池管理
-- `vllm/v1/core/chunk_cache_manager.py` - 缓存管理器
+- `vllm/v1/core/chunk_kv_connector.py` - GPU↔CPU适配器
 - `vllm/v1/worker/position_remapper.py` - 位置重映射
-- `vllm/v1/core/chunk_structures.py` - 数据结构
-- `vllm/config/chunk_cache.py` - 配置
+- `vllm/v1/core/chunk_lru_policy.py` - LRU淘汰策略
 
 **修改模块** (7个):
 - `vllm/config/vllm_config.py` - 添加 ChunkCacheConfig
-- `vllm/v1/engine/llm_engine.py` - 集成 ChunkCacheManager
+- `vllm/v1/engine/llm_engine.py` - 集成 ChunkCacheEngine
 - `vllm/v1/engine/input_processor.py` - 解析 chunked prompt
 - `vllm/v1/worker/gpu_model_runner.py` - 新增方法
 - `vllm-ascend/attention/utils.py` - 扩展元数据
 - `vllm-ascend/attention/sfa_v1.py` - 集成 chunk mask
+- `vllm/v1/core/kv_cache_spec.py` - 扩展KV规格定义
 
 ### 2.4 核心流程
 
@@ -287,457 +315,86 @@ Chunk Pool (15%):     位置无关缓存 (CaMemAllocator "chunk_cache")
 
 ## 3. 核心实现
 
-### 3.1 数据结构
+### 3.1 数据结构 (参考LMCache CacheEngineKey)
 
-**ChunkHash** - 内容哈希 (位置无关):
+**设计原则**:
+- 使用统一的数据结构表示chunk key
+- 包含元数据但不包含实际KV数据
+- 支持可扩展的配置字段
+
+**ChunkKey** - Chunk的唯一标识 (位置无关):
 ```python
 @dataclass(frozen=True)
-class ChunkHash:
-    hash_bytes: bytes      # XXHash128(16 bytes)
+class ChunkKey:
+    """
+    Chunk唯一标识 (参考LMCache CacheEngineKey)
+
+    Attributes:
+        chunk_hash: 内容哈希 (XXHash128/SHA256)
+        token_count: chunk的token数量
+        num_blocks: 占用的块数量
+        fmt: KV格式 (标准/MLA)
+        model_name: 模型名称
+        kv_dtype: KV数据类型
+    """
+    chunk_hash: bytes              # 16 bytes (XXHash128)
     token_count: int
     num_blocks: int
+    fmt: str                       # "standard" or "mla"
+    model_name: str
+    kv_dtype: torch.dtype
 ```
 
-**ChunkKVCache** - 缓存的 Chunk KV:
+**ChunkKV** - Chunk的KV数据封装:
 ```python
 @dataclass
-class ChunkKVCache:
-    chunk_hash: ChunkHash
-    block_ids: list[int]           # Chunk Pool 中的块
+class ChunkKV:
+    """
+    Chunk KV数据封装 (参考LMCache MemoryObj)
+
+    Attributes:
+        chunk_key: Chunk唯一标识
+        block_ids: 物理块ID列表
+        key_cache: K cache [num_layers, num_tokens, num_kv_heads, head_dim]
+        value_cache: V cache
+        virtual_position: 虚拟位置 (用于统一缓存)
+        metadata: 扩展元数据
+    """
+    chunk_key: ChunkKey
+    block_ids: list[int]
     key_cache: torch.Tensor
     value_cache: torch.Tensor
-    virtual_position_start: int    # 虚拟位置
+    virtual_position_start: int
     virtual_position_end: int
+    metadata: dict                # 扩展字段
 ```
 
-**RemappedChunkKV** - 重映射后的 Chunk (包含 KV 拷贝):
+**RemappedChunkKV** - 重映射后的Chunk KV:
 ```python
 @dataclass
 class RemappedChunkKV:
-    block_ids: list[int]           # 主 KV Pool 的新块
-    key_cache: torch.Tensor        # 已应用新位置 RoPE
+    """
+    重映射后的Chunk KV (包含KV数据拷贝)
+
+    Attributes:
+        chunk_key: 原始chunk标识
+        block_ids: 主KV池的新块ID
+        key_cache: 已应用新位置RoPE的K
+        value_cache: 已应用新位置RoPE的V
+        position_start: 实际起始位置
+        position_end: 实际结束位置
+        positions: 位置张量
+    """
+    chunk_key: ChunkKey
+    block_ids: list[int]
+    key_cache: torch.Tensor
     value_cache: torch.Tensor
     position_start: int
     position_end: int
-    chunk_hash: ChunkHash
+    positions: torch.Tensor
 ```
 
 **ChunkedPrompt** - 分块提示词:
-```python
-@dataclass
-class ChunkedPrompt:
-    sys_prompt: list[int]          # 作为特殊 chunk
-    chunks: list[list[int]]
-    user_question: list[int]
-    separator: str = "##"
-```
-
-### 3.2 LLMEngine 集成
-
-**初始化** (`vllm/v1/engine/llm_engine.py`):
-```python
-class LLMEngine:
-    def __init__(self, vllm_config: VllmConfig, ...):
-        # 新增: 初始化 ChunkCacheManager
-        if vllm_config.chunk_cache_config.enable_chunk_cache:
-            ascend_allocator = self._init_ascend_allocator()
-            self.chunk_cache_manager = ChunkCacheManager(
-                config=vllm_config.chunk_cache_config,
-                kv_cache_spec=self.model_config.kv_cache_spec,
-                block_size=self.cache_config.block_size,
-                ascend_allocator=ascend_allocator,
-            )
-        else:
-            self.chunk_cache_manager = None
-```
-
-**请求处理**:
-```python
-def step(self):
-    # 检测 chunked prompt
-    if scheduled_req.use_chunk_cache:
-        chunk_kvs = self._get_or_compute_chunks(chunked_prompt)
-        # 传递给 Worker 执行
-```
-
-### 3.3 InputProcessor 扩展
-
-**解析 chunked prompt** (`vllm/v1/engine/input_processor.py`):
-```python
-class InputProcessor:
-    def process_inputs(self, prompts, ...):
-        # 检测 "##" 分隔符
-        if "##" in prompt_str:
-            chunked_prompt = self.parse_chunked_prompt(
-                prompt_tokens, separator="##"
-            )
-            request_metadata["use_chunk_cache"] = True
-            request_metadata["chunked_prompt"] = chunked_prompt
-```
-
-### 3.4 ChunkCacheManager 核心
-
-**获取或计算 Chunk** (`vllm/v1/core/chunk_cache_manager.py`):
-```python
-class ChunkCacheManager:
-    def get_or_compute_chunk(
-        self, chunk_tokens, position_offset, model_runner
-    ) -> RemappedChunkKV:
-        # 1. 计算哈希
-        chunk_hash = self.chunk_hash_index.compute_hash(chunk_tokens)
-
-        # 2. 查找缓存
-        cached_chunk = self.chunk_hash_index.lookup(chunk_hash)
-
-        if cached_chunk:
-            # 3a. 命中: 拷贝重映射 (3-5ms)
-            return self.position_remapper.remap_and_copy(
-                cached_chunk, position_offset
-            )
-
-        # 3b. 未命中: 计算并缓存 (50-60ms)
-        # 淘汰 LRU
-        self.chunk_block_pool.evict_lru_until_enough(required_blocks)
-
-        # 在虚拟位置计算
-        virtual_pos = self._get_virtual_position(len(chunk_tokens))
-        computed_kv = model_runner.compute_chunk_kv(
-            chunk_tokens, virtual_pos
-        )
-
-        # 存储
-        self.chunk_hash_index.insert(chunk_hash, computed_kv)
-
-        # 拷贝重映射到目标位置
-        return self.position_remapper.remap_and_copy(
-            computed_kv, position_offset
-        )
-```
-
-### 3.5 PositionRemapper 实现
-
-**KV 拷贝重映射** (`vllm/v1/worker/position_remapper.py`):
-```python
-class PositionRemapper:
-    def remap_and_copy(
-        self, chunk_kv_cache, new_position_offset
-    ) -> RemappedChunkKV:
-        # 1. 从主 KV Pool 分配新块
-        new_block_ids = self._allocate_from_main_pool(num_blocks)
-
-        # 2. 计算新位置序列
-        new_positions = torch.arange(
-            new_position_offset,
-            new_position_offset + num_tokens,
-            device="npu"
-        )
-
-        # 3. 拷贝 KV 并应用 RoPE (NPU 加速)
-        cos, sin = self._compute_rope(new_positions)
-        remapped_k, remapped_v = torch_npu.npu_kv_rmsnorm_rope_cache(
-            kv_input=None,
-            cos=cos, sin=sin,
-            positions=new_positions,
-            key_cache=src_k,
-            value_cache=src_v,
-            block_ids=new_block_ids,
-        )
-
-        # 4. 返回重映射后的 KV
-        return RemappedChunkKV(
-            block_ids=new_block_ids,
-            key_cache=remapped_k,
-            value_cache=remapped_v,
-            position_start=new_position_offset,
-            position_end=new_position_offset + num_tokens,
-        )
-```
-
-### 3.6 GPUModelRunner 扩展
-
-**处理 Chunks** (`vllm/v1/worker/gpu_model_runner.py`):
-```python
-class GPUModelRunner:
-    def get_or_compute_chunks(
-        self, chunked_prompt
-    ) -> List[RemappedChunkKV]:
-        remapped_kvs = []
-        current_position = 0
-
-        # 处理所有 chunks (包括 sys_prompt)
-        for chunk_tokens in chunked_prompt.get_all_chunks():
-            remapped_kv = self.chunk_cache_manager.get_or_compute_chunk(
-                chunk_tokens, current_position, self
-            )
-            remapped_kvs.append(remapped_kv)
-            current_position += len(chunk_tokens)
-
-        return remapped_kvs
-```
-
-### 3.7 Chunk-Aware Attention Mask
-
-**构建隔离 Mask** (`vllm-ascend/attention/attention_mask.py`):
-```python
-def get_chunk_aware_mask(
-    num_tokens, chunk_ids, chunk_boundaries, dtype, device
-) -> torch.Tensor:
-    """
-    Chunk 隔离的 causal attention mask
-
-    规则:
-    - sys_prompt: 标准 causal
-    - chunk tokens: 可看 sys_prompt + 同 chunk (causal)
-    - question: 可看所有 (causal)
-    """
-    mask = torch.zeros(num_tokens, num_tokens, dtype=dtype, device=device)
-
-    for query_pos in range(num_tokens):
-        query_chunk_id = chunk_ids[query_pos]
-
-        if query_chunk_id >= 0:  # Chunk token
-            # 可看 sys_prompt
-            mask[query_pos, :sys_end] = 0
-            # 可看同 chunk 内的前序 token
-            mask[query_pos, chunk_start:query_pos] = 0
-
-        elif query_chunk_id == -2:  # Question
-            mask[query_pos, :query_pos] = 0
-
-        else:  # sys_prompt
-            mask[query_pos, :query_pos] = 0
-
-    return mask
-```
-
-### 3.8 配置
-
-**ChunkCacheConfig** (`vllm/config/chunk_cache.py`):
-```python
-@dataclass
-class ChunkCacheConfig:
-    enable_chunk_cache: bool = False
-    chunk_separator: str = "##"
-    max_chunks: int = 500
-    max_chunk_tokens: int = 4096
-    chunk_cache_gpu_memory_utilization: float = 0.15
-    chunk_hash_algo: str = "xxhash"
-```
-
-**VllmConfig 扩展**:
-```python
-@dataclass
-class VllmConfig:
-    # ... 现有字段 ...
-    chunk_cache_config: ChunkCacheConfig = field(
-        default_factory=ChunkCacheConfig
-    )
-```
-
----
-
-## 4. 关键接口
-
-### 4.1 ChunkCacheManager
-
-**职责**: Chunk缓存管理器，协调ChunkHashIndex和ChunkBlockPool
-
-**位置**: `vllm/v1/core/chunk_cache_manager.py`
-
-**主要接口**:
-
-```python
-class ChunkCacheManager:
-    """Chunk缓存管理器核心接口"""
-
-    def __init__(
-        self,
-        config: ChunkCacheConfig,
-        kv_cache_spec: KVCacheSpec,
-        block_size: int,
-        ascend_allocator: Optional[CaMemAllocator] = None,
-    ):
-        """
-        初始化ChunkCacheManager
-
-        功能:
-            - 初始化ChunkHashIndex (哈希索引)
-            - 初始化ChunkBlockPool (块池管理)
-            - 初始化PositionRemapper (位置重映射)
-            - 初始化统计信息收集器
-
-        Args:
-            config: Chunk缓存配置
-            kv_cache_spec: KV缓存规格 {num_kv_heads, head_dim, dtype}
-            block_size: 块大小 (tokens per block)
-            ascend_allocator: 昇腾内存分配器 (可选)
-
-        Raises:
-            ValueError: 配置参数无效
-        """
-
-    def get_or_compute_chunk(
-        self,
-        chunk_tokens: List[int],
-        position_offset: int,
-        model_runner: "GPUModelRunner",
-    ) -> RemappedChunkKV:
-        """
-        获取或计算chunk KV cache (核心方法)
-
-        功能:
-            1. 计算chunk的内容哈希
-            2. 查找缓存
-            3. [命中] 拷贝重映射到目标位置
-            4. [未命中] 淘汰LRU → 虚拟位置计算 → 缓存 → 拷贝重映射
-
-        Args:
-            chunk_tokens: chunk的token序列
-            position_offset: 目标位置偏移
-            model_runner: 模型运行器引用
-
-        Returns:
-            RemappedChunkKV: 重映射后的chunk KV (在主KV池中)
-
-        Raises:
-            ValueError: chunk_tokens为空
-            MemoryError: 内存不足 (即使LRU淘汰后)
-            RuntimeError: model_runner未初始化
-
-        时间复杂度:
-            缓存命中: O(1) + O(n) 拷贝重映射
-            缓存未命中: O(n) 计算 + O(n) 拷贝重映射
-        """
-
-    def get_stats(self) -> ChunkCacheStats:
-        """
-        获取缓存统计信息
-
-        Returns:
-            ChunkCacheStats: 统计信息副本 (线程安全)
-            - total_chunks: 总chunk数
-            - cache_hits/misses: 命中/未命中次数
-            - hit_rate: 命中率
-            - total_tokens_cached: 缓存token总数
-            - evicted_chunks: 淘汰chunk数
-            - current_memory_mb: 当前内存使用(MB)
-        """
-
-    def clear(self):
-        """清空所有缓存 (测试用)"""
-
-    def cleanup_remapped_blocks(self, block_ids: List[int]):
-        """
-        清理重映射使用的块 (请求结束后调用)
-
-        Args:
-            block_ids: 要释放的块ID列表 (主KV池)
-        """
-```
-
-**依赖模块**:
-- `ChunkHashIndex`: 哈希索引 (计算hash、查找、插入、淘汰)
-- `ChunkBlockPool`: 块池管理 (分配、释放、LRU淘汰)
-- `PositionRemapper`: 位置重映射 (KV拷贝+RoPE编码)
-
-### 4.2 PositionRemapper
-
-**职责**: 位置重映射器，负责KV拷贝和RoPE重新编码
-
-**位置**: `vllm/v1/worker/position_remapper.py`
-
-**主要接口**:
-
-```python
-class PositionRemapper:
-    """位置重映射器 - KV拷贝和RoPE重新编码"""
-
-    def __init__(
-        self,
-        block_pool: ChunkBlockPool,
-        kv_cache_spec: KVCacheSpec,
-        device: torch.device,
-    ):
-        """
-        初始化
-
-        功能:
-            - 保存块池引用
-            - 保存KV缓存规格 (num_kv_heads, head_dim, dtype)
-            - 初始化RoPE缓存 (位置 -> cos/sin)
-
-        Args:
-            block_pool: Chunk块池 (用于分配)
-            kv_cache_spec: KV缓存规格
-            device: 设备 (npu或cuda)
-        """
-
-    def remap_and_copy(
-        self,
-        chunk_kv_cache: ChunkKVCache,
-        new_position_offset: int,
-    ) -> RemappedChunkKV:
-        """
-        拷贝并重映射chunk KV cache (核心方法)
-
-        功能:
-            1. 从主KV池分配新块
-            2. 计算新位置序列 (position_offset to position_offset + num_tokens)
-            3. 获取或计算RoPE编码 (带缓存)
-            4. 拷贝KV数据并应用新位置的RoPE (使用NPU加速)
-            5. 创建RemappedChunkKV对象
-
-        Args:
-            chunk_kv_cache: 缓存的chunk KV (在chunk池中)
-            new_position_offset: 新的位置偏移
-
-        Returns:
-            RemappedChunkKV: 重映射后的KV (在主KV池中)
-                - block_ids: 主KV池的新块
-                - key_cache/value_cache: 已应用新位置RoPE的KV
-                - position_start/end: 实际位置范围
-
-        Raises:
-            MemoryError: 主KV池内存不足
-            RuntimeError: NPU拷贝失败或RoPE计算失败
-
-        时间复杂度: O(num_tokens)
-        空间复杂度: O(num_tokens) (新分配blocks)
-
-        昇腾NPU优化:
-            - 使用 torch_npu.npu_kv_rmsnorm_rope_cache()
-            - 一次调用完成KV拷贝+RoPE编码
-            - 预期开销: ~2-5ms (4K tokens)
-        """
-
-    def release_remapped_blocks(self, block_ids: List[int]):
-        """
-        释放重映射使用的物理块 (请求结束后)
-
-        功能:
-            - 将块归还给主KV池
-            - 请求结束后调用,清理临时分配
-
-        Args:
-            block_ids: 要释放的块ID列表
-        """
-```
-
-**RoPE缓存优化**:
-- 缓存key: `(position_start, position_end)`
-- 避免重复计算相同位置范围的RoPE
-- 显著减少重复请求的开销
-
-### 4.3 ChunkedPromptParser
-
-**职责**: 分块提示词解析器，识别和处理chunk分隔符
-
-**位置**: `vllm/v1/engine/chunked_prompt_parser.py`
-
-**设计参考**: LMcache `SegmentTokenDatabase` 使用滑动窗口快速匹配
-
-**数据结构**:
-
 ```python
 @dataclass
 class ChunkedPrompt:
@@ -745,242 +402,1258 @@ class ChunkedPrompt:
     分块提示词结构
 
     Attributes:
-        sys_prompt: 第一个chunk (特殊)
+        sys_prompt: 系统提示词 (作为第一个chunk)
         chunks: 文档chunks列表
         user_question: 用户问题
         separator: 分隔符 (默认 "##")
-        chunk_boundaries: 每个chunk的边界 [(start, end), ...]
+        chunk_boundaries: chunk边界 [(start, end), ...]
     """
-    sys_prompt: List[int]
-    chunks: List[List[int]]
-    user_question: List[int]
+    sys_prompt: list[int]
+    chunks: list[list[int]]
+    user_question: list[int]
     separator: str = "##"
-    chunk_boundaries: List[Tuple[int, int]]
+    chunk_boundaries: list[tuple[int, int]]
 
-    def get_all_chunks(self) -> List[List[int]]:
+    def get_all_chunks(self) -> list[list[int]]:
         """获取所有需要缓存的chunks (包括sys_prompt)"""
 ```
+
+### 3.2 ChunkCacheEngine 核心流程 (参考LMCache LMCacheEngine)
+
+**设计原则**:
+- Engine作为协调层，不直接处理数据
+- 提供统一的lookup/store/clear API
+- 参考LMCache的异步设计模式
+
+**核心API**:
+```python
+class ChunkCacheEngine:
+    """
+    Chunk缓存引擎 (参考LMCache LMCacheEngine)
+
+    职责:
+    - 协调TokenParser、StorageManager、KVConnector
+    - 提供统一的lookup/store/clear API
+    - 管理缓存生命周期
+    """
+
+    def lookup(
+        self,
+        tokens: list[int],
+        position_offset: int,
+        **kwargs
+    ) -> tuple[list[RemappedChunkKV], int]:
+        """
+        查找并获取chunks (参考LMCache.retrieve)
+
+        流程:
+        1. ChunkTokenParser.parse() → ChunkedPrompt
+        2. 对每个chunk:
+           - ChunkHashIndex.lookup(chunk_key)
+           - [HIT] → PositionRemapper.remap()
+           - [MISS] → break
+        3. 返回命中的RemappedChunkKV列表
+
+        Returns:
+            (remapped_chunks, num_hit_tokens)
+        """
+
+    def store(
+        self,
+        tokens: list[int],
+        chunk_kv: ChunkKV,
+        **kwargs
+    ) -> None:
+        """
+        存储chunk (参考LMCache.store)
+
+        流程:
+        1. 计算chunk_key
+        2. ChunkStorageManager.allocate()
+        3. ChunkKVConnector.to_cpu()
+        4. ChunkHashIndex.insert()
+        """
+
+    def clear(
+        self,
+        tokens: Optional[list[int]] = None
+    ) -> int:
+        """清空缓存 (参考LMCache.clear)"""
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+```
+
+### 3.3 ChunkTokenParser (参考LMCache TokenDatabase)
+
+**设计原则**:
+- 支持多种解析策略 (fixed chunk / separator)
+- 提供validate和parse两个阶段
+- 返回ChunkedPrompt结构
+
+**主要接口**:
+```python
+class ChunkTokenParser:
+    """
+    Token解析器 (参考LMCache TokenDatabase)
+
+    职责:
+    - 解析chunked prompt
+    - 识别chunk边界
+    - 验证格式
+    """
+
+    def parse(
+        self,
+        tokens: list[int],
+        separator: str = "##",
+    ) -> ChunkedPrompt:
+        """
+        解析chunked prompt (参考TokenDatabase.process_tokens)
+
+        功能:
+        1. 使用滑动窗口识别分隔符 (torch.unfold)
+        2. 分割: sys_prompt, chunks, user_question
+        3. 计算chunk_boundaries
+
+        Args:
+            tokens: token序列
+            separator: 分隔符
+
+        Returns:
+            ChunkedPrompt结构
+        """
+
+    def validate(
+        self,
+        prompt_str: str,
+        separator: str = "##",
+    ) -> bool:
+        """验证prompt格式"""
+
+    def compute_hash(
+        self,
+        tokens: list[int]
+    ) -> bytes:
+        """
+        计算内容哈希 (参考TokenDatabase._hash_tokens)
+
+        Args:
+            tokens: token序列
+
+        Returns:
+            16 bytes hash (XXHash128)
+        """
+```
+
+### 3.4 ChunkStorageManager (参考LMCache StorageManager)
+
+**设计原则**:
+- 管理存储后端 (CPU/Disk)
+- 分配/释放物理块
+- 实现LRU淘汰策略
+
+**主要接口**:
+```python
+class ChunkStorageManager:
+    """
+    存储管理器 (参考LMCache StorageManager)
+
+    职责:
+    - 管理CPU/Disk存储后端
+    - 分配/释放物理块
+    - LRU淘汰策略
+    """
+
+    def allocate(
+        self,
+        chunk_key: ChunkKey,
+        kv_shape: tuple,
+        kv_dtype: torch.dtype,
+    ) -> Optional[list[int]]:
+        """
+        分配存储块
+
+        流程:
+        1. 检查容量
+        2. [不足] → ChunkLRUPolicy.evict()
+        3. 分配块
+        4. 更新LRU链表
+
+        Returns:
+            block_ids列表，失败返回None
+        """
+
+    def free(
+        self,
+        block_ids: list[int]
+    ) -> None:
+        """释放存储块"""
+
+    def contains(
+        self,
+        chunk_key: ChunkKey
+    ) -> bool:
+        """检查chunk是否存在"""
+
+    def get(
+        self,
+        chunk_key: ChunkKey
+    ) -> Optional[ChunkKV]:
+        """获取chunk数据"""
+
+    def put(
+        self,
+        chunk_key: ChunkKey,
+        chunk_kv: ChunkKV
+    ) -> None:
+        """存储chunk数据"""
+
+    def get_memory_usage(self) -> dict:
+        """获取内存使用情况"""
+```
+
+### 3.5 ChunkKVConnector (参考LMCache GPUConnector)
+
+**设计原则**:
+- 封装GPU↔CPU数据传输
+- 支持异步传输
+- 零拷贝优化 (pinned memory)
+
+**主要接口**:
+```python
+class ChunkKVConnector:
+    """
+    GPU↔CPU数据适配器 (参考LMCache GPUConnector)
+
+    职责:
+    - GPU KV → CPU MemoryObj
+    - CPU MemoryObj → GPU KV
+    - 异步传输优化
+    """
+
+    def to_cpu(
+        self,
+        gpu_kv: tuple[torch.Tensor, torch.Tensor],
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> ChunkKV:
+        """
+        GPU KV → CPU (参考GPUConnector.batched_from_gpu)
+
+        功能:
+        1. 分配pinned memory
+        2. 异步拷贝 (cudaMemcpyAsync)
+        3. 返回ChunkKV
+        """
+
+    def to_gpu(
+        self,
+        chunk_kv: ChunkKV,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        CPU → GPU KV (参考GPUConnector.batched_to_gpu)
+
+        功能:
+        1. 分配GPU memory
+        2. 异步拷贝
+        3. 返回 (key_cache, value_cache)
+        """
+```
+
+### 3.6 PositionRemapper (特有功能)
+
+**主要接口**:
+```python
+class PositionRemapper:
+    """
+    位置重映射器 (特有功能)
+
+    职责:
+    - 拷贝KV数据
+    - 应用新位置的RoPE
+    - NPU加速 (torch_npu.npu_kv_rmsnorm_rope_cache)
+    """
+
+    def remap(
+        self,
+        src_kv: ChunkKV,
+        dst_position: int,
+    ) -> RemappedChunkKV:
+        """
+        重映射chunk KV到新位置
+
+        功能:
+        1. 从主KV池分配块
+        2. 计算新位置的RoPE (带缓存)
+        3. 拷贝KV并应用RoPE (NPU加速)
+        4. 返回RemappedChunkKV
+
+        时间复杂度: O(num_tokens)
+        预期开销: ~2-5ms (4K tokens)
+        """
+
+    def release(
+        self,
+        block_ids: list[int]
+    ) -> None:
+        """释放重映射的块"""
+```
+
+### 3.7 ChunkLRUPolicy (参考LMCache cache_policy/lru.py)
+
+**主要接口**:
+```python
+class ChunkLRUPolicy:
+    """
+    LRU淘汰策略 (参考LMCache cache_policy/lru.py)
+
+    职责:
+    - 维护LRU链表
+    - 触发淘汰
+    - 更新访问顺序
+    """
+
+    def evict(
+        self,
+        num_blocks: int
+    ) -> list[ChunkKey]:
+        """
+        淘汰chunks
+
+        Returns:
+            被淘汰的ChunkKey列表
+        """
+
+    def touch(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """更新访问顺序"""
+
+    def get_lru_list(self) -> list[ChunkKey]:
+        """获取LRU列表"""
+```
+
+### 3.8 配置系统 (参考LMCache config.py)
+
+**设计原则**:
+- 支持YAML/环境变量/命令行
+- 类型安全的配置定义
+- 配置别名和废弃警告
+
+**ChunkCacheConfig**:
+```python
+@dataclass
+class ChunkCacheConfig:
+    """
+    Chunk缓存配置 (参考LMCache LMCacheEngineConfig)
+
+    支持的配置源:
+    - YAML配置文件
+    - 环境变量 (LMCACHE_CHUNK_*)
+    - 命令行参数
+    """
+    # 基础配置
+    enable_chunk_cache: bool = False
+    chunk_separator: str = "##"
+    chunk_size: int = 256
+
+    # 存储配置
+    max_local_cpu_size: float = 5.0        # GB
+    chunk_cache_gpu_memory_utilization: float = 0.15
+    enable_disk: bool = False
+    max_local_disk_size: float = 0.0        # GB
+    local_disk_path: Optional[str] = None
+
+    # Hash配置
+    chunk_hash_algo: str = "xxhash"        # "xxhash" or "sha256"
+
+    # 性能配置
+    enable_async_loading: bool = False
+    enable_freeze_mode: bool = False
+```
+
+**VllmConfig扩展**:
+```python
+@dataclass
+class VllmConfig:
+    # ... 现有字段 ...
+
+    # 新增: Chunk缓存配置
+    chunk_cache: ChunkCacheConfig = field(
+        default_factory=ChunkCacheConfig
+    )
+```
+
+### 3.9 集成流程 (参考LMCache集成方式)
+
+**LLMEngine初始化**:
+```python
+class LLMEngine:
+    def __init__(self, vllm_config: VllmConfig, ...):
+        # ... 现有初始化 ...
+
+        # 新增: 初始化ChunkCacheEngine (如果启用)
+        if vllm_config.chunk_cache.enable_chunk_cache:
+            self.chunk_cache_engine = ChunkCacheEngine(
+                config=vllm_config.chunk_cache,
+                metadata=self._create_chunk_metadata(),
+            )
+        else:
+            self.chunk_cache_engine = None
+```
+
+**InputProcessor扩展**:
+```python
+class InputProcessor:
+    def process_inputs(self, prompts, ...):
+        # 检测chunked prompt
+        if "##" in prompt_str:
+            chunked_prompt = self.chunk_token_parser.parse(
+                prompt_tokens, separator="##"
+            )
+            request_metadata["use_chunk_cache"] = True
+            request_metadata["chunked_prompt"] = chunked_prompt
+```
+
+**GPUModelRunner扩展**:
+```python
+class GPUModelRunner:
+    def get_or_compute_chunks(
+        self,
+        chunked_prompt: ChunkedPrompt,
+    ) -> list[RemappedChunkKV]:
+        """
+        获取或计算chunks (参考LMCache流程)
+
+        流程:
+        1. 调用 ChunkCacheEngine.lookup()
+        2. 对未命中的chunks:
+           - compute_chunk_kv()
+           - 调用 ChunkCacheEngine.store()
+        3. 返回所有RemappedChunkKV
+        """
+```
+
+---
+
+## 4. 关键接口 (参考LMCache接口设计)
+
+### 4.1 ChunkCacheEngine (参考LMCache LMCacheEngine)
+
+**职责**: Chunk缓存引擎，作为协调层提供统一API
+
+**位置**: `vllm/v1/core/chunk_cache_engine.py`
+
+**设计参考**: LMCache LMCacheEngine的分层架构
 
 **主要接口**:
 
 ```python
-class ChunkedPromptParser:
-    """分块提示词解析器 - 滑动窗口快速匹配"""
+class ChunkCacheEngine:
+    """
+    Chunk缓存引擎 (参考LMCache LMCacheEngine)
+
+    职责:
+    - 协调TokenParser、StorageManager、KVConnector、PositionRemapper
+    - 提供统一的lookup/store/clear API
+    - 管理缓存生命周期
+    - 统计信息收集
+
+    组成部分:
+    - token_parser: ChunkTokenParser实例
+    - storage_manager: ChunkStorageManager实例
+    - kv_connector: ChunkKVConnector实例
+    - position_remapper: PositionRemapper实例
+    - lru_policy: ChunkLRUPolicy实例
+    """
 
     def __init__(
         self,
+        config: ChunkCacheConfig,
+        metadata: "ChunkMetadata",
+    ):
+        """
+        初始化Chunk缓存引擎
+
+        功能:
+            1. 创建TokenParser
+            2. 创建StorageManager (CPU/Disk后端)
+            3. 创建KVConnector (GPU↔CPU)
+            4. 创建PositionRemapper (NPU加速)
+            5. 创建LRU Policy
+
+        Args:
+            config: Chunk缓存配置
+            metadata: 元数据 (模型名称、KV规格等)
+
+        Raises:
+            ValueError: 配置参数无效
+        """
+
+    def lookup(
+        self,
+        tokens: list[int],
+        position_offset: int,
+        **kwargs
+    ) -> tuple[list[RemappedChunkKV], int]:
+        """
+        查找并获取chunks (参考LMCache.retrieve)
+
+        流程:
+        1. token_parser.parse() → ChunkedPrompt
+        2. 对每个chunk:
+           a. storage_manager.contains(chunk_key)
+           b. [HIT]
+              - storage_manager.get() → ChunkKV
+              - position_remapper.remap() → RemappedChunkKV
+           c. [MISS] → break (prefix匹配)
+        3. 返回 (remapped_chunks, num_hit_tokens)
+
+        Args:
+            tokens: token序列
+            position_offset: 目标起始位置
+            **kwargs: 扩展参数
+
+        Returns:
+            (remapped_chunks, num_hit_tokens)
+            - remapped_chunks: 重映射后的chunk KV列表
+            - num_hit_tokens: 命中的token总数
+
+        时间复杂度:
+            - 最佳 (全部未命中): O(1)
+            - 最差 (全部命中): O(n * m)
+              n = num_chunks, m = remap时间
+        """
+
+    def store(
+        self,
+        tokens: list[int],
+        chunk_kv: ChunkKV,
+        **kwargs
+    ) -> None:
+        """
+        存储chunk (参考LMCache.store)
+
+        流程:
+        1. 计算chunk_key
+        2. storage_manager.allocate()
+        3. kv_connector.to_cpu() (如果需要)
+        4. storage_manager.put()
+
+        Args:
+            tokens: token序列
+            chunk_kv: 要存储的chunk KV
+            **kwargs: 扩展参数
+
+        Raises:
+            MemoryError: 存储不足 (即使LRU淘汰后)
+            RuntimeError: 存储失败
+        """
+
+    def clear(
+        self,
+        tokens: Optional[list[int]] = None,
+        locations: Optional[list[str]] = None,
+    ) -> int:
+        """
+        清空缓存 (参考LMCache.clear)
+
+        Args:
+            tokens: 如果指定，只清除这些tokens对应的chunk
+                   如果为None，清空所有缓存
+            locations: 存储位置列表 (如 ["cpu", "disk"])
+
+        Returns:
+            清除的chunk数量
+        """
+
+    def get_stats(self) -> dict:
+        """
+        获取缓存统计信息 (参考LMCache stats_monitor)
+
+        Returns:
+            {
+                "total_chunks": int,
+                "cache_hits": int,
+                "cache_misses": int,
+                "hit_rate": float,
+                "total_tokens_cached": int,
+                "evicted_chunks": int,
+                "current_memory_mb": {
+                    "cpu": float,
+                    "disk": float,
+                },
+            }
+        """
+
+    def pin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """
+        Pin chunk，防止被淘汰 (参考LMCache pin机制)
+
+        Args:
+            chunk_key: 要pin的chunk
+        """
+
+    def unpin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """Unpin chunk"""
+
+    def close(self) -> None:
+        """
+        关闭引擎，释放资源 (参考LMCache.close)
+        """
+```
+
+### 4.2 ChunkTokenParser (参考LMCache TokenDatabase)
+
+**职责**: Token解析器，识别chunk边界
+
+**位置**: `vllm/v1/core/chunk_token_parser.py`
+
+**设计参考**: LMCache TokenDatabase + SegmentTokenDatabase
+
+**主要接口**:
+
+```python
+class ChunkTokenParser:
+    """
+    Token解析器 (参考LMCache TokenDatabase)
+
+    职责:
+    - 解析chunked prompt
+    - 识别chunk边界 (滑动窗口)
+    - 计算内容哈希
+    - 验证格式
+    """
+
+    def __init__(
+        self,
+        config: ChunkCacheConfig,
         tokenizer,
-        separator: str = "##",
-        device: torch.device = torch.device("cpu"),
     ):
         """
         初始化
 
         功能:
-            - 编码分隔符为tokens (移除BOS token)
-            - 准备滑动窗口匹配的sep_tokens tensor
+            - 编码分隔符为tokens
+            - 准备滑动窗口匹配的tensor
 
         Args:
+            config: Chunk缓存配置
             tokenizer: 分词器
-            separator: 分隔符字符串 (默认 "##")
-            device: 分隔符tokens所在设备
         """
 
     def parse(
         self,
-        prompt_tokens: Union[torch.Tensor, List[int]],
-        prompt_str: Optional[str] = None,
+        tokens: list[int],
+        separator: str = "##",
     ) -> ChunkedPrompt:
         """
-        解析分块提示词
+        解析chunked prompt (参考TokenDatabase.process_tokens)
 
         功能:
-            1. 转换为torch.Tensor (如果是List[int])
-            2. 使用滑动窗口快速匹配分隔符
-            3. 解析: sys_prompt (第一个分隔符之前)
-            4. 解析: chunks (分隔符之间)
-            5. 解析: question (最后一个分隔符之后)
-            6. 验证: 不允许空chunk
-
-        Args:
-            prompt_tokens: token序列 (torch.Tensor或List[int])
-            prompt_str: 原始字符串 (可选，用于验证)
-
-        Returns:
-            ChunkedPrompt: 解析后的分块结构
-
-        Raises:
-            ValueError: 格式错误、分隔符不存在、空chunk
-            RuntimeError: 解析失败
-
-        性能:
-            - 使用 torch.unfold() 滑动窗口: O((n-m+1) * m)
-            - n = len(tokens), m = len(separator_tokens)
-            - 比朴素O(n * m)更优
-        """
-
-    def _fast_split_by_subtensor(
-        self,
-        tokens: torch.Tensor,
-    ) -> List[torch.Tensor]:
-        """
-        使用滑动窗口快速匹配分隔符
-
-        功能:
-            1. 使用 tokens.unfold(0, sep_len, 1) 创建滑动窗口
-            2. 比较每个窗口与sep_tokens
-            3. 在匹配位置切分tokens
-
-        Args:
-            tokens: token张量
-
-        Yields:
-            分割后的token张量
-
-        时间复杂度: O((n-m+1) * m)
-        """
-
-    def _find_separator_positions(
-        self,
-        tokens: torch.Tensor,
-    ) -> List[int]:
-        """
-        查找所有分隔符的起始位置
-
-        Returns:
-            List[int]: 分隔符起始位置列表
-        """
-
-    def validate_and_parse(
-        self,
-        prompt_str: str,
-    ) -> ChunkedPrompt:
-        """
-        验证并解析提示词 (带字符串验证)
-
-        功能:
-            1. 验证分隔符存在
-            2. 验证分隔符数量 (至少1个)
-            3. Tokenize
-            4. 调用parse()
-
-        Args:
-            prompt_str: 原始提示词字符串
-
-        Returns:
-            ChunkedPrompt: 解析后的结构
-
-        Raises:
-            ValueError: 格式验证失败
-        """
-```
-
-**性能优化**:
-- 使用 `torch.unfold()` 创建滑动窗口
-- 向量化比较，避免Python循环
-- 时间复杂度: O((n-m+1) * m)
-
-### 4.4 GPUModelRunner 扩展
-
-**职责**: GPU模型运行器，新增chunk缓存处理方法
-
-**位置**: `vllm/v1/worker/gpu_model_runner.py`
-
-**新增接口**:
-
-```python
-class GPUModelRunner:
-    """GPU模型运行器 - Chunk缓存扩展"""
-
-    def set_chunk_cache_manager(self, manager: ChunkCacheManager):
-        """
-        注入ChunkCacheManager (由LLMEngine调用)
-
-        功能:
-            - 保存manager引用
-            - 初始化ChunkedPromptParser
-
-        Args:
-            manager: Chunk缓存管理器实例
-        """
-
-    def parse_chunked_prompt(
-        self,
-        prompt_tokens: Union[torch.Tensor, List[int]],
-        prompt_str: Optional[str] = None,
-    ) -> ChunkedPrompt:
-        """
-        解析分块提示词
-
-        Args:
-            prompt_tokens: token序列
-            prompt_str: 原始字符串 (可选)
-
-        Returns:
-            ChunkedPrompt: 解析后的分块结构
-
-        Raises:
-            RuntimeError: chunk_parser未初始化
-        """
-
-    def get_or_compute_chunks(
-        self,
-        chunked_prompt: ChunkedPrompt,
-    ) -> List[RemappedChunkKV]:
-        """
-        获取或计算所有chunks的KV cache (包括sys_prompt)
-
-        功能:
-            1. 遍历所有chunks (sys_prompt + chunks)
-            2. 对每个chunk调用 chunk_cache_manager.get_or_compute_chunk()
-            3. 累加position_offset
-            4. 错误处理: 清理已分配的KV
-
-        Args:
-            chunked_prompt: 解析后的分块提示词
-
-        Returns:
-            List[RemappedChunkKV]: 所有chunk的重映射KV
-
-        Raises:
-            RuntimeError: ChunkCacheManager未初始化
-            MemoryError: 内存不足
-
-        注意:
-            - 错误时自动清理已分配的block_ids
-        """
-
-    def compute_chunk_kv(
-        self,
-        tokens: List[int],
-        position: int,
-        block_pool: "ChunkBlockPool",
-    ) -> ChunkKVCache:
-        """
-        在指定位置计算chunk KV
-
-        功能:
-            1. 从block_pool分配块
-            2. 准备input_ids和positions
-            3. 执行模型前向传播 (kv_cache初始为空)
-            4. 提取key_cache和value_cache
-            5. 存储到分配的块中
-            6. 计算chunk_hash
+        1. 转换为torch.Tensor
+        2. 使用torch.unfold()滑动窗口识别分隔符
+        3. 分割: sys_prompt, chunks, user_question
+        4. 计算chunk_boundaries
 
         Args:
             tokens: token序列
-            position: 起始位置
-            block_pool: 块池 (用于分配)
+            separator: 分隔符
 
         Returns:
-            ChunkKVCache: 计算得到的chunk KV
+            ChunkedPrompt结构
 
         Raises:
-            RuntimeError: 模型执行失败
-            MemoryError: 块池内存不足
+            ValueError: 格式错误、分隔符不存在、空chunk
+
+        性能:
+            - O((n-m+1) * m) where n=len(tokens), m=len(separator)
+            - 使用torch.unfold()向量化操作
+        """
+
+    def validate(
+        self,
+        prompt_str: str,
+        separator: str = "##",
+    ) -> bool:
+        """
+        验证prompt格式
+
+        检查:
+        1. 分隔符存在
+        2. 分隔符数量 >= 1
+        3. 不存在空chunk
+
+        Args:
+            prompt_str: 原始提示词字符串
+            separator: 分隔符
+
+        Returns:
+            True if valid, False otherwise
+        """
+
+    def compute_hash(
+        self,
+        tokens: list[int]
+    ) -> bytes:
+        """
+        计算内容哈希 (参考TokenDatabase._hash_tokens)
+
+        Args:
+            tokens: token序列
+
+        Returns:
+            16 bytes hash (XXHash128)
 
         注意:
-            - 错误时自动清理已分配的block_ids
+            - 不包含位置信息 (位置无关)
+            - 使用vLLM的hash函数 (兼容性)
+        """
+```
+
+### 4.3 ChunkStorageManager (参考LMCache StorageManager)
+
+**职责**: 存储管理器，管理CPU/Disk存储后端
+
+**位置**: `vllm/v1/core/chunk_storage_manager.py`
+
+**设计参考**: LMCache StorageManager
+
+**主要接口**:
+
+```python
+class ChunkStorageManager:
+    """
+    存储管理器 (参考LMCache StorageManager)
+
+    职责:
+    - 管理CPU/Disk存储后端
+    - 分配/释放物理块
+    - 实现LRU淘汰策略
+    - Pin/unpin机制
+
+    存储层次:
+    - LocalCPUBackend: CPU pinned memory (热缓存)
+    - LocalDiskBackend: 本地磁盘 (可选)
+    """
+
+    def __init__(
+        self,
+        config: ChunkCacheConfig,
+        metadata: "ChunkMetadata",
+    ):
+        """
+        初始化
+
+        功能:
+        1. 创建CPU后端 (pinned memory)
+        2. [可选] 创建Disk后端
+        3. 创建LRU Policy
+        4. 初始化块分配器
+
+        Args:
+            config: Chunk缓存配置
+            metadata: 元数据
+        """
+
+    def allocate(
+        self,
+        chunk_key: ChunkKey,
+        kv_shape: tuple,
+        kv_dtype: torch.dtype,
+    ) -> Optional[list[int]]:
+        """
+        分配存储块 (参考StorageManager.allocate)
+
+        流程:
+        1. 检查容量
+        2. [不足] → lru_policy.evict() → 淘汰chunks
+        3. 分配块
+        4. 更新LRU链表
+
+        Args:
+            chunk_key: Chunk标识
+            kv_shape: KV shape [num_layers, num_tokens, num_kv_heads, head_dim]
+            kv_dtype: KV数据类型
+
+        Returns:
+            block_ids列表，失败返回None
+
+        时间复杂度:
+            - O(1) 分配
+            - O(k) 淘汰 (k = 淘汰的chunk数)
+        """
+
+    def free(
+        self,
+        block_ids: list[int]
+    ) -> None:
+        """
+        释放存储块
+
+        Args:
+            block_ids: 要释放的块ID列表
+        """
+
+    def contains(
+        self,
+        chunk_key: ChunkKey
+    ) -> bool:
+        """
+        检查chunk是否存在 (参考StorageManager.contains)
+
+        Args:
+            chunk_key: Chunk标识
+
+        Returns:
+            True if exists, False otherwise
+        """
+
+    def get(
+        self,
+        chunk_key: ChunkKey
+    ) -> Optional[ChunkKV]:
+        """
+        获取chunk数据 (参考StorageManager.get)
+
+        功能:
+        1. 查找chunk
+        2. 更新LRU (touch)
+        3. 返回ChunkKV
+
+        Args:
+            chunk_key: Chunk标识
+
+        Returns:
+            ChunkKV，不存在返回None
+        """
+
+    def put(
+        self,
+        chunk_key: ChunkKey,
+        chunk_kv: ChunkKV
+    ) -> None:
+        """
+        存储chunk数据 (参考StorageManager.put)
+
+        Args:
+            chunk_key: Chunk标识
+            chunk_kv: Chunk KV数据
+        """
+
+    def batched_contains(
+        self,
+        chunk_keys: list[ChunkKey],
+    ) -> tuple[int, dict[str, list[ChunkKey]]]:
+        """
+        批量检查chunks (参考StorageManager.batched_contains)
+
+        Args:
+            chunk_keys: Chunk标识列表
+
+        Returns:
+            (num_hit, block_mapping)
+            - num_hit: 命中的chunk数量
+            - block_mapping: location → [ChunkKey]
+        """
+
+    def get_memory_usage(self) -> dict:
+        """
+        获取内存使用情况
+
+        Returns:
+            {
+                "cpu_used_mb": float,
+                "cpu_total_mb": float,
+                "cpu_utilization": float,
+                "disk_used_mb": float,  # 如果启用
+                "disk_total_mb": float,
+                "num_cached_chunks": int,
+            }
+        """
+
+    def touch(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """
+        更新LRU访问顺序 (参考StorageManager.touch)
+
+        Args:
+            chunk_key: Chunk标识
+        """
+
+    def evict(
+        self,
+        num_blocks: int
+    ) -> list[ChunkKey]:
+        """
+        淘汰chunks (参考LRU policy)
+
+        Args:
+            num_blocks: 需要释放的块数
+
+        Returns:
+            被淘汰的ChunkKey列表
+        """
+
+    def pin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """
+        Pin chunk，防止被淘汰 (参考LMCache pin)
+
+        Args:
+            chunk_key: Chunk标识
+        """
+
+    def unpin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """Unpin chunk"""
+
+    def close(self) -> None:
+        """关闭存储管理器，释放资源"""
+```
+
+### 4.4 ChunkKVConnector (参考LMCache GPUConnector)
+
+**职责**: GPU↔CPU数据传输适配器
+
+**位置**: `vllm/v1/core/chunk_kv_connector.py`
+
+**设计参考**: LMCache GPUConnector
+
+**主要接口**:
+
+```python
+class ChunkKVConnector:
+    """
+    GPU↔CPU数据适配器 (参考LMCache GPUConnector)
+
+    职责:
+    - GPU KV → CPU MemoryObj
+    - CPU MemoryObj → GPU KV
+    - 异步传输优化
+    - 零拷贝优化 (pinned memory)
+
+    优化:
+    - 使用pinned memory加速传输
+    - 异步拷贝 (cudaMemcpyAsync)
+    - 批量操作
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        """
+        初始化
+
+        Args:
+            device: 设备 (cuda/npu)
+            dtype: KV数据类型
+        """
+
+    def to_cpu(
+        self,
+        gpu_kv: tuple[torch.Tensor, torch.Tensor],
+        chunk_key: ChunkKey,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> ChunkKV:
+        """
+        GPU KV → CPU (参考GPUConnector.batched_from_gpu)
+
+        功能:
+        1. 分配pinned memory
+        2. 异步拷贝 (cudaMemcpyAsync / npu_memcpy)
+        3. 封装为ChunkKV
+
+        Args:
+            gpu_kv: (key_cache, value_cache) GPU tensors
+            chunk_key: Chunk标识
+            stream: CUDA stream (可选)
+
+        Returns:
+            ChunkKV (CPU)
+
+        性能:
+            - 使用pinned memory: ~6-10 GB/s
+            - 异步拷贝，不阻塞
+        """
+
+    def to_gpu(
+        self,
+        chunk_kv: ChunkKV,
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        CPU → GPU KV (参考GPUConnector.batched_to_gpu)
+
+        功能:
+        1. 分配GPU memory
+        2. 异步拷贝
+        3. 返回 (key_cache, value_cache)
+
+        Args:
+            chunk_kv: Chunk KV (CPU)
+            stream: CUDA stream (可选)
+
+        Returns:
+            (key_cache, value_cache) GPU tensors
+
+        性能:
+            - 使用pinned memory: ~6-10 GB/s
+            - 异步拷贝，不阻塞
+        """
+
+    def batched_to_cpu(
+        self,
+        gpu_kvs: list[tuple[torch.Tensor, torch.Tensor]],
+        chunk_keys: list[ChunkKey],
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> list[ChunkKV]:
+        """
+        批量GPU → CPU (参考GPUConnector.batched_from_gpu)
+
+        功能:
+        1. 批量分配pinned memory
+        2. 批量异步拷贝
+        3. 返回ChunkKV列表
+
+        Args:
+            gpu_kvs: GPU KV列表
+            chunk_keys: Chunk标识列表
+            stream: CUDA stream (可选)
+
+        Returns:
+            ChunkKV列表
+
+        性能:
+            - 批量操作，减少kernel launch overhead
+        """
+
+    def batched_to_gpu(
+        self,
+        chunk_kvs: list[ChunkKV],
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """
+        批量CPU → GPU (参考GPUConnector.batched_to_gpu)
+
+        功能:
+        1. 批量分配GPU memory
+        2. 批量异步拷贝
+        3. 返回GPU KV列表
+
+        Args:
+            chunk_kvs: Chunk KV列表 (CPU)
+            stream: CUDA stream (可选)
+
+        Returns:
+            GPU KV列表
+        """
+```
+
+### 4.5 PositionRemapper (特有功能)
+
+**职责**: 位置重映射器，KV拷贝+RoPE重新编码
+
+**位置**: `vllm/v1/worker/position_remapper.py`
+
+**主要接口**:
+
+```python
+class PositionRemapper:
+    """
+    位置重映射器 (特有功能，LMCache无对应)
+
+    职责:
+    - 拷贝KV数据
+    - 应用新位置的RoPE
+    - NPU加速 (torch_npu.npu_kv_rmsnorm_rope_cache)
+    - RoPE缓存优化
+
+    NPU优化:
+    - 使用 torch_npu.npu_kv_rmsnorm_rope_cache()
+    - 一次调用完成KV拷贝+RoPE编码
+    - 预期开销: ~2-5ms (4K tokens)
+    """
+
+    def __init__(
+        self,
+        kv_cache_spec: "KVCacheSpec",
+        device: torch.device,
+    ):
+        """
+        初始化
+
+        功能:
+            - 保存KV规格
+            - 初始化RoPE缓存
+
+        Args:
+            kv_cache_spec: KV缓存规格
+            device: 设备 (npu/cuda)
+        """
+
+    def remap(
+        self,
+        src_kv: ChunkKV,
+        dst_position: int,
+    ) -> RemappedChunkKV:
+        """
+        重映射chunk KV到新位置 (核心方法)
+
+        功能:
+        1. 从主KV池分配块
+        2. 计算新位置序列
+        3. 获取/计算RoPE编码 (带缓存)
+        4. 拷贝KV并应用RoPE (NPU加速)
+        5. 创建RemappedChunkKV
+
+        Args:
+            src_kv: 源Chunk KV (在虚拟位置)
+            dst_position: 目标位置偏移
+
+        Returns:
+            RemappedChunkKV (在主KV池，应用了新位置RoPE)
+
+        时间复杂度: O(num_tokens)
+        预期开销: ~2-5ms (4K tokens)
+
+        NPU优化:
+            - torch_npu.npu_kv_rmsnorm_rope_cache()
+            - 一次kernel调用完成拷贝+RoPE
+        """
+
+    def release(
+        self,
+        block_ids: list[int]
+    ) -> None:
+        """
+        释放重映射的块 (请求结束后)
+
+        Args:
+            block_ids: 要释放的块ID列表
+        """
+```
+
+### 4.6 ChunkLRUPolicy (参考LMCache cache_policy/lru.py)
+
+**职责**: LRU淘汰策略
+
+**位置**: `vllm/v1/core/chunk_lru_policy.py`
+
+**设计参考**: LMCache cache_policy/lru.py
+
+**主要接口**:
+
+```python
+class ChunkLRUPolicy:
+    """
+    LRU淘汰策略 (参考LMCache cache_policy/lru.py)
+
+    职责:
+    - 维护LRU链表
+    - 触发淘汰
+    - 更新访问顺序
+    - Pin机制
+    """
+
+    def __init__(self, capacity_blocks: int):
+        """
+        初始化
+
+        Args:
+            capacity_blocks: 总容量 (块数)
+        """
+
+    def evict(
+        self,
+        num_blocks: int,
+        skip_pinned: bool = True,
+    ) -> list[ChunkKey]:
+        """
+        淘汰chunks
+
+        功能:
+        1. 从LRU链表尾部开始
+        2. 跳过pinned chunks (可选)
+        3. 淘汰直到释放足够的块
+
+        Args:
+            num_blocks: 需要释放的块数
+            skip_pinned: 是否跳过pinned chunks
+
+        Returns:
+            被淘汰的ChunkKey列表
+
+        Raises:
+            RuntimeError: 无法释放足够的块 (所有chunks都被pin)
+        """
+
+    def touch(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """
+        更新访问顺序 (访问时调用)
+
+        功能:
+        - 将chunk移到LRU链表头部
+
+        Args:
+            chunk_key: Chunk标识
+        """
+
+    def pin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """
+        Pin chunk，防止被淘汰
+
+        Args:
+            chunk_key: Chunk标识
+        """
+
+    def unpin(
+        self,
+        chunk_key: ChunkKey
+    ) -> None:
+        """Unpin chunk"""
+
+    def get_lru_list(self) -> list[ChunkKey]:
+        """
+        获取LRU列表 (最不常用 → 最常用)
+
+        Returns:
+            ChunkKey列表 (按LRU顺序)
+        """
+
+    def get_stats(self) -> dict:
+        """
+        获取统计信息
+
+        Returns:
+            {
+                "total_chunks": int,
+                "pinned_chunks": int,
+                "lru_list_size": int,
+                "capacity_utilization": float,
+            }
         """
 ```
 
