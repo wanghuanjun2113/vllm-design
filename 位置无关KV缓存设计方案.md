@@ -1082,7 +1082,278 @@ class GPUModelRunner:
 
 ---
 
-## 4. 数据结构设计
+## 4. ChunkCacheManager 集成设计
+
+### 4.1 与现有模块的集成关系
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     LLMEngine (vllm/v1/engine/)             │
+│                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
+│  │InputProcessor│→ │ ChunkCache   │→ │ EngineCoreClient │  │
+│  │              │  │   Manager    │  │                  │  │
+│  │ 解析chunked  │  │ (新增)       │  │ 调度执行         │  │
+│  │ prompt       │  │              │  │                  │  │
+│  └──────────────┘  └──────┬───────┘  └──────────────────┘  │
+│                            ↓                                 │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │           Worker (vllm/v1/worker/)                   │  │
+│  │                                                       │  │
+│  │  GPUModelRunner (修改)                               │  │
+│  │  - 新增: parse_chunked_prompt()                      │  │
+│  │  - 新增: get_or_compute_chunks()                     │  │
+│  │  - 新增: compute_chunk_kv()                          │  │
+│  │  - 调用: ChunkCacheManager.get_or_compute_chunk()    │  │
+│  └──────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 初始化集成点
+
+**LLMEngine.__init__() 中初始化**:
+
+```python
+# 文件: vllm/v1/engine/llm_engine.py
+
+from vllm.v1.core.chunk_cache_manager import ChunkCacheManager
+
+class LLMEngine:
+    def __init__(self, vllm_config: VllmConfig, ...):
+        # ... 现有初始化代码 ...
+
+        # 新增: 初始化 ChunkCacheManager
+        if vllm_config.chunk_cache_config.enable_chunk_cache:
+            ascend_allocator = self._init_ascend_allocator()  # 获取Ascend分配器
+            self.chunk_cache_manager = ChunkCacheManager(
+                config=vllm_config.chunk_cache_config,
+                kv_cache_spec=self.model_config.kv_cache_spec,
+                block_size=self.cache_config.block_size,
+                ascend_allocator=ascend_allocator,
+            )
+        else:
+            self.chunk_cache_manager = None
+
+        # 现有的 InputProcessor 初始化
+        self.input_processor = InputProcessor(self.vllm_config, tokenizer)
+
+    def _init_ascend_allocator(self):
+        """初始化Ascend内存分配器 (如果可用)"""
+        try:
+            from vllm_ascend.device_allocator.camem import CaMemAllocator
+            return CaMemAllocator()
+        except ImportError:
+            logger.warning("vllm-ascend not available, chunk cache disabled")
+            return None
+```
+
+**Worker初始化时接收ChunkCacheManager**:
+
+```python
+# 文件: vllm/v1/worker/gpu_model_runner.py
+
+class GPUModelRunner(WorkerBase):
+    def __init__(self, vllm_config: VllmConfig, ...):
+        super().__init__(...)
+        self.vllm_config = vllm_config
+
+        # 新增: 接收 ChunkCacheManager 引用
+        self.chunk_cache_manager = None  # 将由 LLMEngine 注入
+```
+
+### 4.3 请求处理流程集成
+
+**Step 1: InputProcessor 解析 chunked prompt**
+
+```python
+# 文件: vllm/v1/engine/input_processor.py
+
+class InputProcessor:
+    def process_inputs(self, prompts: PromptType, ...) -> List[EngineCoreRequest]:
+        # 现有逻辑: tokenization
+        # ...
+
+        # 新增: 检测并解析 chunked prompt
+        if self._is_chunked_prompt(prompt_str):
+            chunked_prompt = self.parse_chunked_prompt(
+                prompt_tokens,
+                separator=self.vllm_config.chunk_cache_config.chunk_separator,
+            )
+            # 将 chunked_prompt 信息附加到 request metadata
+            request_metadata["chunked_prompt"] = chunked_prompt
+            request_metadata["use_chunk_cache"] = True
+
+        # ... 现有逻辑 ...
+        return requests
+```
+
+**Step 2: LLMEngine 调度时使用 ChunkCacheManager**
+
+```python
+# 文件: vllm/v1/engine/llm_engine.py
+
+class LLMEngine:
+    def step(self) -> List[RequestOutput]:
+        """执行一步调度"""
+        # 调度请求
+        scheduler_outputs = self.scheduler.schedule()
+
+        # 处理每个请求
+        for scheduled_req in scheduler_outputs.scheduled_requests:
+            req_id = scheduled_req.request_id
+
+            # 新增: 检查是否使用 chunk cache
+            if scheduled_req.use_chunk_cache:
+                chunked_prompt = scheduled_req.chunked_prompt
+
+                # 获取或计算所有 chunks
+                chunk_kvs = self._get_or_compute_chunks(chunked_prompt)
+
+                # 将 chunk KV 信息附加到请求
+                scheduled_req.chunk_kvs = chunk_kvs
+
+        # 调用 EngineCore 执行
+        engine_core_outputs = self.engine_core.execute(scheduler_outputs)
+
+        # ... 现有逻辑 ...
+        return outputs
+
+    def _get_or_compute_chunks(self, chunked_prompt):
+        """获取或计算所有 chunks (通过 Worker)"""
+        return self.engine_core.model_executor.get_or_compute_chunks(
+            chunked_prompt=chunked_prompt,
+        )
+```
+
+**Step 3: GPUModelRunner 处理 chunks**
+
+```python
+# 文件: vllm/v1/worker/gpu_model_runner.py
+
+class GPUModelRunner:
+    def set_chunk_cache_manager(self, manager: ChunkCacheManager):
+        """注入 ChunkCacheManager (由 EngineCore 调用)"""
+        self.chunk_cache_manager = manager
+
+    def get_or_compute_chunks(
+        self,
+        chunked_prompt: ChunkedPrompt,
+    ) -> List[RemappedChunkKV]:
+        """
+        获取或计算所有 chunks
+
+        这是 ChunkCacheManager 与 Worker 的核心集成点
+        """
+        if self.chunk_cache_manager is None:
+            raise RuntimeError("ChunkCacheManager not initialized")
+
+        remapped_kvs = []
+        current_position = 0
+
+        # 处理所有 chunks (包括 sys_prompt)
+        for chunk_tokens in chunked_prompt.get_all_chunks():
+            # 调用 ChunkCacheManager 获取或计算
+            remapped_kv = self.chunk_cache_manager.get_or_compute_chunk(
+                chunk_tokens=chunk_tokens,
+                position_offset=current_position,
+                model_runner=self,  # 传入自己,用于调用 compute_chunk_kv
+            )
+            remapped_kvs.append(remapped_kv)
+            current_position += len(chunk_tokens)
+
+        return remapped_kvs
+```
+
+### 4.4 核心交互序列
+
+```
+User Request (with "##" separator)
+    ↓
+LLMEngine.step()
+    ↓
+InputProcessor.process_inputs()
+    - 检测分隔符
+    - parse_chunked_prompt()
+    - 设置 use_chunk_cache=True
+    ↓
+LLMEngine._get_or_compute_chunks()
+    ↓
+EngineCore → Worker (GPUModelRunner)
+    ↓
+GPUModelRunner.get_or_compute_chunks()
+    - for each chunk:
+    -   ChunkCacheManager.get_or_compute_chunk()
+    ↓
+ChunkCacheManager.get_or_compute_chunk()
+    - ChunkHashIndex.compute_hash()
+    - lookup() → [HIT] or [MISS]
+    - [HIT]: PositionRemapper.remap_and_copy()
+    - [MISS]: compute_chunk_kv() → cache → remap_and_copy()
+    ↓
+返回 RemappedChunkKV[] → EngineCore.execute() → 生成结果
+```
+
+### 4.5 配置集成
+
+**VllmConfig 扩展**:
+
+```python
+# 文件: vllm/config/vllm_config.py
+
+from dataclasses import dataclass, field
+from vllm.config.chunk_cache import ChunkCacheConfig
+
+@dataclass
+class VllmConfig:
+    # ... 现有字段 ...
+    chunk_cache_config: ChunkCacheConfig = field(
+        default_factory=ChunkCacheConfig
+    )
+```
+
+**ChunkCacheConfig 定义**:
+
+```python
+# 文件: vllm/config/chunk_cache.py
+
+from dataclasses import dataclass, field
+
+@dataclass
+class ChunkCacheConfig:
+    """Chunk Cache 配置"""
+    enable_chunk_cache: bool = False
+    chunk_separator: str = "##"
+    max_chunks: int = 500
+    max_chunk_tokens: int = 4096
+    chunk_cache_gpu_memory_utilization: float = 0.15
+    chunk_hash_algo: str = "xxhash"  # xxhash or sha256
+```
+
+### 4.6 关键设计决策
+
+1. **ChunkCacheManager 属于 Engine 层**
+   - 在 LLMEngine.__init__() 中初始化
+   - 通过引用传递给 Worker
+   - 管理全局的 chunk 缓存池
+
+2. **最小化现有代码修改**
+   - InputProcessor: 添加 chunked prompt 解析逻辑
+   - LLMEngine: 添加 chunk cache 调用逻辑
+   - GPUModelRunner: 添加新方法,不修改现有方法
+
+3. **向后兼容**
+   - enable_chunk_cache=False 时,ChunkCacheManager 为 None
+   - 现有请求流程不受影响
+   - 只在检测到 "##" 分隔符时启用 chunk cache
+
+4. **与 vLLM-Ascend 集成**
+   - CaMemAllocator 用于独立内存池
+   - 使用 "chunk_cache" 标签化管理
+   - 如果 vllm-ascend 不可用,chunk cache 自动禁用
+
+---
+
+## 5. 数据结构设计
 
 ### 4.1 ChunkHash (内容哈希)
 
