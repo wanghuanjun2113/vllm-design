@@ -134,26 +134,139 @@ ATTENTION LAYER (vllm-ascend/attention/)
 
 ### 2.4 核心流程
 
+#### 场景1: 缓存未命中 - 生成Chunk KV并缓存
+
 ```
-User Request ("You are helpful.##Doc1##What?")
+User Request: "You are helpful.##Doc1##What?"
     ↓
-InputProcessor.parse_chunked_prompt()
-    → ChunkedPrompt {sys_prompt, chunks, question}
+[1] Prompt解析
+    InputProcessor.parse_chunked_prompt()
+    → ChunkedPrompt {
+        sys_prompt: [1,2,3],
+        chunks: [[10,11,...]],
+        user_question: [100,101]
+      }
     ↓
-GPUModelRunner.get_or_compute_chunks()
-    → for chunk in chunks:
-    →   ChunkCacheManager.get_or_compute_chunk()
-    →     - hash → lookup → [HIT/MISS]
-    →     - [HIT]: remap_and_copy() (3-5ms)
-    →     - [MISS]: compute → cache → remap (50-60ms)
+[2] Chunk哈希查找 (每个chunk)
+    ChunkHashIndex.compute_hash(chunk_tokens)
+    → hash_abc → lookup → [MISS]
     ↓
-GPUModelRunner.compute_question_kv()
+[3] 生成Chunk KV (虚拟位置)
+    分配 Chunk Pool 块
+    GPUModelRunner.compute_chunk_kv(
+        tokens=chunk_tokens,
+        position=VIRTUAL_POS_START  # 虚拟位置 [0, max_chunk_len)
+    )
+    → 应用虚拟位置的RoPE编码
+    → ChunkKVCache {
+        block_ids: [100, 101],
+        key_cache, value_cache,
+        virtual_position: [0, 100)
+      }
     ↓
-AscendSFABackend.forward()
-    → with chunk-aware mask
+[4] 缓存Chunk KV
+    ChunkHashIndex.insert(hash_abc, ChunkKVCache)
+    → 存储到Chunk Pool (持久化)
     ↓
-Generated Output
+[5] 拷贝并重映射到实际位置
+    PositionRemapper.remap_and_copy(
+        cached_kv, new_position=0  # sys_prompt在位置0
+    )
+    → 分配主KV Pool块 [5000, 5001]
+    → 拷贝KV数据 (100→5000, 101→5001)
+    → 应用实际位置的RoPE编码
+    → RemappedChunkKV {
+        block_ids: [5000, 5001],
+        key_cache, value_cache,  # 已应用位置0的RoPE
+        position: [0, 100)
+      }
+    ↓
+[6] 构建Chunk-Aware Attention Mask
+    AttentionMaskBuilder.get_chunk_aware_mask()
+    → sys_prompt tokens: 标准 causal attention
+    → chunk tokens: 可看 sys_prompt + 同chunk内causal
+    → question tokens: 可看所有内容
+    ↓
+[7] 执行推理
+    AscendSFABackend.forward(
+        query, key, value,
+        chunk_attn_mask,
+        remapped_kv
+    )
+    → Generated Output
 ```
+
+#### 场景2: 缓存命中 - 拷贝拼接KV并推理
+
+```
+User Request: "Different sys.##Doc1##Tell me more"
+    ↓
+[1] Prompt解析
+    InputProcessor.parse_chunked_prompt()
+    → ChunkedPrompt {
+        sys_prompt: [5,6,7],  # 不同！
+        chunks: [[10,11,...]],  # 相同 → 缓存命中
+        user_question: [200,201]
+      }
+    ↓
+[2] Chunk哈希查找 (每个chunk)
+    ChunkHashIndex.compute_hash([10,11,...])
+    → hash_def → lookup → [HIT]  ✓
+    ↓
+[3] 拷贝并重映射到新位置
+    PositionRemapper.remap_and_copy(
+        cached_kv,  # 来自缓存，虚拟位置[0,100)
+        new_position=3  # 新sys_prompt在位置0-2
+    )
+    → 分配主KV Pool块 [6000, 6001]
+    → 拷贝KV数据 (100→6000, 101→6001)
+    → 应用位置3的RoPE编码 (覆盖原虚拟位置RoPE)
+    → RemappedChunkKV {
+        block_ids: [6000, 6001],
+        key_cache, value_cache,  # 已应用位置3的RoPE
+        position: [3, 103)
+      }
+    跳过步骤[4-5] (已缓存)
+    ↓
+[4] 计算未命中的sys_prompt
+    sys_prompt [5,6,7] → 缓存未命中
+    → compute_chunk_kv(position=0)
+    → 缓存到hash_xyz
+    → remap_and_copy(new_position=0)
+    ↓
+[5] 拼接所有KV
+    合并:
+    - sys_prompt KV (blocks [7000,7001], pos [0,3))
+    - Doc1 KV (blocks [6000,6001], pos [3,103))  来自缓存
+    - question KV (blocks [7002,7003], pos [103,105))
+    → merged_blocks: [7000,7001,6000,6001,7002,7003]
+    ↓
+[6] 构建Chunk-Aware Attention Mask
+    根据新的chunk边界构建mask
+    → chunk_ids: [-1,-1,-1, 0,0,..., -2,-2]
+    → chunk隔离: Doc1不能看新sys_prompt的token
+    ↓
+[7] 执行推理
+    AscendSFABackend.forward(
+        query, key, value,
+        chunk_attn_mask,
+        merged_kv
+    )
+    → Generated Output
+```
+
+**核心差异对比**:
+
+| 步骤 | 缓存未命中 | 缓存命中 |
+|------|-----------|---------|
+| 哈希查找 | MISS | HIT |
+| KV计算 | ✓ (50ms) | ✗ |
+| 缓存存储 | ✓ | ✗ |
+| KV拷贝 | ✓ (3-5ms) | ✓ (3-5ms) |
+| RoPE处理 | 虚拟位置→实际位置 | 虚拟位置→实际位置 |
+| Attention Mask | chunk隔离 | chunk隔离 (新边界) |
+| 总时间 | ~55ms | ~5ms |
+| 加速比 | 1x | **12x** |
 
 ### 2.5 内存管理
 
