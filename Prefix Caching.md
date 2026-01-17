@@ -1,759 +1,970 @@
-# Prefix Caching
+# Prefix Caching (Automatic Prefix Caching)
 
 ## 概述
 
-Prefix Caching（前缀缓存）是 vLLM 中用于优化推理性能的关键特性,它通过缓存和复用已计算的 KV cache 来显著降低 Time To First Token (TTFT) 和提升整体吞吐量。该特性特别适用于多轮对话、RAG 场景、以及具有重复前缀的批处理请求。
+**Automatic Prefix Caching (APC)** 是 vLLM 的核心优化特性之一,通过缓存已处理请求的 KV cache,使得新请求如果与已有请求共享相同前缀时,可以直接复用 KV cache,跳过共享部分的重复计算。
 
-### 核心功能
+### 核心原理
 
-**自动缓存复用**: Prefix Caching 自动识别请求之间的共同前缀,并将已计算的 KV cache 块存储在 GPU 内存中。当新请求到来时,系统会自动查找最长的缓存命中前缀,避免重复计算。
+APC 基于以下关键机制实现:
 
-**基于块的哈希索引**: 系统将输入序列切分为固定大小的块(通常为 16-256 个 token),每个块通过密码学哈希算法(SHA256/xxhash)生成唯一标识。哈希值包含父块哈希、当前块 token IDs 以及额外上下文信息(如 LoRA、多模态输入),确保缓存的正确性和安全性。
+1. **块哈希链 (Block Hash Chain)**: 每个 KV cache block 计算一个哈希值,该哈希值包含父 block 的哈希、当前 block 的 token IDs 以及额外的键(如多模态输入、LoRA 适配器、cache_salt)。这种链式哈希设计使得相同的前缀必然产生相同的哈希序列。
 
-**多注意力类型支持**: Prefix Caching 支持多种注意力机制,包括:
-- Full Attention: 标准的全注意力机制
-- Sliding Window Attention: 滑动窗口注意力,自动处理窗口外块的替换
-- Chunked Local Attention: 分块局部注意力
-- MLA (Multi-Head Latent Attention): 多头潜在注意力
-- Mamba: 状态空间模型
-- Cross Attention: 交叉注意力(不支持缓存共享)
+2. **基于哈希的查找**: 当新请求到达时,vLLM 会将其 token 序列分成固定大小的块(默认 16 个 token/block),计算每个块的哈希值,然后在哈希表中查找是否存在完全匹配的哈希链。如果找到匹配,就直接复用对应的物理 KV cache blocks。
 
-**LRU 淘汰策略**: 当 GPU 内存不足时,系统采用最近最少使用(LRU)策略自动淘汰缓存块。每个块维护引用计数,支持多个请求共享同一块缓存数据。
+3. **引用计数与 LRU 驱逐**: 每个 block 维护引用计数 (`ref_cnt`)。当 block 被多个请求共享时,`ref_cnt > 1`。当请求完成释放 block 时,`ref_cnt` 减 1。只有当 `ref_cnt == 0` 时,block 才被放入 LRU 驱逐队列。当需要分配新 block 但空闲池不足时,从 LRU 队列头部(最久未使用)驱逐 block。
 
-**混合模型支持**: 对于包含多种注意力类型的混合模型(如 Gemma3),Prefix Caching 采用迭代算法找到所有类型都能接受的最长公共前缀,确保缓存的一致性。
+4. **多注意力类型支持**: vLLM v1 支持多种注意力机制,每种类型的缓存策略不同:
+   - **FullAttention**: 标准的完整注意力,从左到右查找最长匹配前缀
+   - **SlidingWindowAttention**: 滑动窗口注意力,从右到左查找窗口内的连续 blocks
+   - **ChunkedLocalAttention**: 分块局部注意力,只缓存当前 attention 窗口内的 blocks
+   - **MambaAttention**: 线性注意力 (Mamba/SSM),只保留最后一个计算 token 的状态
+   - **SinkFullAttention**: Sink token + 完整注意力,sink blocks 永不驱逐
 
-### 性能优势
+### 性能收益
 
-在典型工作负载中,Prefix Caching 可以实现:
-- **3-10x TTFT 降低**: 对于包含共同前缀的多轮对话或批量请求
-- **2-5x 吞吐量提升**: 通过减少重复计算提高 GPU 利用率
-- **内存效率**: 块级共享和引用计数避免数据冗余
+APC 在以下场景中能带来显著的性能提升:
+
+- **长文档问答**: 用户反复对同一长文档(如软件手册、年度报告)提出不同问题时,APC 允许 vLLM 仅处理一次该长文档,所有后续请求都能复用其 KV cache,从而实现更高的吞吐量和更低的延迟。
+- **多轮对话**: 用户在同一聊天会话中进行多轮对话时,APC 可以跨对话轮次复用聊天历史的处理结果,避免每轮都重新处理整个历史记录。
+- **提示词模板复用**: 当多个请求使用相同的系统提示词或模板时(如 RAG 应用中的固定文档上下文),APC 可以自动复用这些共享前缀。
+
+### 局限性
+
+- APC 仅减少**查询处理时间**(prefill 阶段),不减少**生成新 token 的时间**(decode 阶段)
+- 当 vLLM 大部分时间用于生成答案(如答案长度很长)时,APC 的收益有限
+- 当新请求与任何现有请求都不共享前缀时,无法实现计算复用
+- 需要额外的 GPU 内存来维护 prefix cache,可能影响可服务的并发请求数
 
 ## 架构设计
 
-Prefix Caching 在 vLLM v1 引擎中的架构位置如下:
+### 系统架构图
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Scheduler / Engine Core                   │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │           KVCacheManager                              │   │
-│  │  - get_computed_blocks(request)                       │   │
-│  │  - allocate_slots(...)                                │   │
-│  │  - free(request_id)                                   │   │
-│  └───────────────────────┬──────────────────────────────┘   │
-│                         │                                    │
-│  ┌──────────────────────▼──────────────────────────────┐   │
-│  │      KVCacheCoordinator                              │   │
-│  │  ┌─────────────┐  ┌──────────────┐                  │   │
-│  │  │ Unitary     │  │ Hybrid       │                  │   │
-│  │  │ Coordinator │  │ Coordinator  │                  │   │
-│  │  └──────┬──────┘  └──────┬───────┘                  │   │
-│  │         │                │                            │   │
-│  │  ┌──────▼────────────────▼─────────┐                │   │
-│  │  │  SingleTypeKVCacheManager[]    │                │   │
-│  │  │  - FullAttentionManager        │                │   │
-│  │  │  - SlidingWindowManager        │                │   │
-│  │  │  - ChunkedLocalAttentionManager│                │   │
-│  │  │  - MambaManager                │                │   │
-│  │  └──────┬─────────────────────────┘                │   │
-│  └─────────┼──────────────────────────────────────────┘   │
-│            │                                                │
-│  ┌─────────▼──────────────────────────────────────────┐   │
-│  │          BlockPool                                 │   │
-│  │  - blocks[]: 所有 KV cache 块                      │   │
-│  │  - free_block_queue: LRU 空闲块队列                │   │
-│  │  - cached_block_hash_to_block: 哈希到块的映射       │   │
-│  │  - null_block: 特殊占位块                          │   │
-│  └────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          vLLM v1 Engine                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────┐      ┌──────────────────────────────────────────┐   │
+│  │  Input Processor  │─────│           Scheduler                       │   │
+│  └───────────────────┘      │  ┌────────────────────────────────────┐  │   │
+│                              │  │  Prefix Cache Hit Detection         │  │   │
+│                              │  │  - get_computed_blocks()            │  │   │
+│                              │  │  - Update num_cached_tokens         │  │   │
+│                              │  └────────────────────────────────────┘  │   │
+│                              └──────────────────────────────────────────┘   │
+│                                             │                                │
+│                                             ▼                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │              KVCacheManager (High-Level Orchestration)               │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  KVCacheCoordinator (Multi-Group Coordination)                 │ │   │
+│  │  │  - UnitaryKVCacheCoordinator (single KV group)                 │ │   │
+│  │  │  - HybridKVCacheCoordinator (multiple KV groups)               │ │   │
+│  │  │    * find_longest_cache_hit()                                  │ │   │
+│  │  │    * allocate_new_computed_blocks()                            │ │   │
+│  │  │    * cache_blocks()                                            │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                        │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  SingleTypeKVCacheManager (Attention-Type Specific)            │ │   │
+│  │  │  - FullAttentionManager                                        │ │   │
+│  │  │  - SlidingWindowManager                                        │ │   │
+│  │  │  - ChunkedLocalAttentionManager                                │ │   │
+│  │  │  - MambaManager                                                │ │   │
+│  │  │  - SinkFullAttentionManager                                    │ │   │
+│  │  │    * find_longest_cache_hit() [class method]                   │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                             │                                │
+│                                             ▼                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                       BlockPool (Core Cache Store)                   │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  BlockHashToBlockMap (Hash Table Lookup)                       │ │   │
+│  │  │  - get_one_block(block_hash, group_ids) -> KVCacheBlock       │ │   │
+│  │  │  - insert(block_hash, block)                                   │ │   │
+│  │  │  - pop(block_hash, block_id)                                   │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                        │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  KVCacheBlock (Block Metadata)                                 │ │   │
+│  │  │  - block_id: Physical block index                              │ │   │
+│  │  │  - ref_cnt: Reference count (shared by requests)               │ │   │
+│  │  │  - _block_hash: Cached hash (when full and cached)             │ │   │
+│  │  │  - is_null: Marker for skipped blocks (sliding window)         │ │   │
+│  │  │  - Linked list pointers for free block queue                   │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                        │   │
+│  │  ┌────────────────────────────────────────────────────────────────┐ │   │
+│  │  │  FreeKVCacheBlockQueue (LRU Eviction Queue)                    │ │   │
+│  │  │  - Doubly-linked list ordered by eviction priority             │ │   │
+│  │  │  - O(1) remove from middle                                     │ │   │
+│  │  │  - Non-blocking operations                                     │ │   │
+│  │  └────────────────────────────────────────────────────────────────┘ │   │
+│  │                                                                        │   │
+│  │  Core Methods:                                                         │   │
+│  │  - get_cached_block(block_hash, group_ids) -> KVCacheBlock           │   │
+│  │  - cache_full_blocks(req_to_blocks)                                   │   │
+│  │  - get_new_blocks(num_blocks) -> List[KVCacheBlock]                   │   │
+│  │  - touch(blocks) -> Increase ref_cnt, remove from free queue          │   │
+│  │  - free_blocks(blocks) -> Decrease ref_cnt, add to free queue         │   │
+│  │  - evict_blocks(block_ids) -> Force eviction from hash table          │   │
+│  │  - reset_prefix_cache() -> Clear all cached blocks                    │   │
+│  │  - get_num_free_blocks() -> Query available blocks                    │   │
+│  │  - get_usage() -> KV cache utilization (0.0-1.0)                      │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌───────────────────┐      ┌──────────────────────────────────────────┐   │
+│  │  Output Processor │◀─────│           Worker                         │   │
+│  └───────────────────┘      │  ┌────────────────────────────────────┐  │   │
+│                              │  │  BlockTable (Token → Block Mapping)│  │   │
+│                              │  │  - Maps token positions to blocks  │  │   │
+│                              │  │  - Converts block IDs to slot      │  │   │
+│                              │  │    mappings for attention kernels  │  │   │
+│                              │  └────────────────────────────────────┘  │   │
+│                              └──────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 核心模块
+### 模块详细说明
 
-#### 1. KVCacheManager (`vllm/v1/core/kv_cache_manager.py`)
+#### 1. BlockPool (`vllm/v1/core/block_pool.py`)
 
-**主要功能**: 作为调度器和 KV cache 系统之间的主接口,隐藏内部数据结构复杂性。
+**核心职责**: GPU KV cache blocks 的分配、缓存查找和驱逐管理。
 
-**对外接口**:
-```python
-class KVCacheManager:
-    def __init__(
-        self,
-        kv_cache_config: KVCacheConfig,
-        max_model_len: int,
-        hash_block_size: int,
-        enable_caching: bool = True,
-        use_eagle: bool = False,
-        log_stats: bool = False,
-        ...
-    )
+**主要类**:
 
-    def get_computed_blocks(
-        self, request: Request
-    ) -> tuple[KVCacheBlocks, int]:
-        """获取请求的缓存块
-        Returns:
-            (cached_blocks, num_computed_tokens)
-        """
+- **`BlockHashToBlockMap`**: 哈希表,将 block 哈希映射到缓存的 blocks
+  - `get_one_block(block_hash, group_ids)`: 获取给定哈希的任意缓存 block
+  - `insert(block_hash, block)`: 插入新的缓存 block
+  - `pop(block_hash, block_id)`: 从缓存中移除特定 block
 
-    def allocate_slots(
-        self,
-        request_id: str,
-        num_tokens: int,
-        computed_blocks: KVCacheBlocks,
-        num_computed_tokens: int,
-        ...
-    ) -> KVCacheBlocks:
-        """为请求分配 KV cache 插槽"""
-
-    def free(self, request_id: str) -> None:
-        """释放请求的所有块"""
-
-    @property
-    def usage(self) -> float:
-        """返回 KV cache 使用率 (0.0-1.0)"""
-```
-
-#### 2. KVCacheCoordinator (`vllm/v1/core/kv_cache_coordinator.py`)
-
-**主要功能**: 协调多个 KV cache 组(支持混合注意力模型)。
-
-**实现类型**:
-- **UnitaryKVCacheCoordinator**: 单一 KV cache 组(最常见)
-- **HybridKVCacheCoordinator**: 多个 KV cache 组(混合注意力模型)
-- **KVCacheCoordinatorNoPrefixCache**: 禁用 Prefix Caching
-
-**对外接口**:
-```python
-class KVCacheCoordinator(ABC):
-    def find_longest_cache_hit(
-        self,
-        block_hashes: list[BlockHash],
-        max_cache_hit_length: int,
-    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
-        """查找最长缓存命中前缀
-        Args:
-            block_hashes: 请求的块哈希列表
-            max_cache_hit_length: 最大命中长度
-        Returns:
-            (cached_blocks_for_each_group, num_hit_tokens)
-        """
-
-    def allocate_new_computed_blocks(...) -> None:
-        """分配并触及缓存命中块"""
-
-    def cache_blocks(request: Request, num_computed_tokens: int) -> None:
-        """缓存完整的块"""
-
-    def free(request_id: str) -> None:
-        """释放请求的所有块"""
-```
-
-#### 3. SingleTypeKVCacheManager (`vllm/v1/core/single_type_kv_cache_manager.py`)
-
-**主要功能**: 管理特定注意力类型的 KV cache 逻辑。
-
-**实现类型**:
-- **FullAttentionManager**: 全注意力,支持任意前缀缓存
-- **SlidingWindowManager**: 滑动窗口,自动处理窗口外块
-- **ChunkedLocalAttentionManager**: 分块局部注意力
-- **MambaManager**: Mamba 状态空间模型
-- **CrossAttentionManager**: 交叉注意力(不支持缓存共享)
-
-**核心方法**:
-```python
-class SingleTypeKVCacheManager(ABC):
-    @classmethod
-    def find_longest_cache_hit(
-        cls,
-        block_hashes: BlockHashList,
-        max_length: int,
-        kv_cache_group_ids: list[int],
-        block_pool: BlockPool,
-        kv_cache_spec: KVCacheSpec,
-        use_eagle: bool,
-        alignment_tokens: int,
-        ...
-    ) -> tuple[list[KVCacheBlock], ...]:
-        """查找最长缓存命中前缀(特定注意力类型)"""
-
-    def allocate_new_computed_blocks(...) -> None:
-        """分配新的计算块,包括:
-        1. 触及(prefix cache hit)的块
-        2. 外部计算块(来自 KV connector)
-        3. 跳过的块(null blocks)
-        """
-
-    def cache_blocks(request: Request, num_tokens: int) -> None:
-        """缓存完整的块到 prefix cache"""
-
-    def free(request_id: str) -> None:
-        """释放块的顺序很重要,从尾部开始释放"""
-```
-
-#### 4. BlockPool (`vllm/v1/core/block_pool.py`)
-
-**主要功能**: 管理 KV cache 的物理内存块,维护 prefix cache 索引。
+- **`BlockPool`**: 核心 block 管理
+  - `get_cached_block(block_hash, group_ids)`: 通过哈希查询可复用的 blocks
+  - `cache_full_blocks(req_to_blocks)`: 缓存已计算的 blocks 以便前缀复用
+  - `get_new_blocks(num_blocks)`: 从空闲池分配新 blocks
+  - `touch(blocks)`: 增加 block 引用计数(缓存命中时调用)
+  - `free_blocks(blocks)`: 释放 blocks,使用 LRU 驱逐
+  - `evict_blocks(block_ids)`: 显式驱逐 prefix cache 中的 blocks
+  - `reset_prefix_cache()`: 清空所有缓存的 blocks
+  - `get_num_free_blocks()`: 查询可用 blocks 数量
+  - `get_usage()`: 获取 KV cache 利用率 (0.0-1.0)
 
 **数据结构**:
-```python
-class BlockPool:
-    blocks: list[KVCacheBlock]  # 所有可用块
-    free_block_queue: FreeKVCacheBlockQueue  # LRU 空闲块队列
-    cached_block_hash_to_block: BlockHashToBlockMap  # 哈希索引
-    null_block: KVCacheBlock  # 特殊占位块
 
-    class KVCacheBlock:
-        block_id: int
-        ref_cnt: int  # 引用计数
-        block_hash: BlockHashWithGroupId | None  # 缓存哈希
-        is_null: bool  # 是否为占位块
+- **`KVCacheBlock`**: Block 元数据
+  - `block_id`: 物理 block 索引 (0 到 num_gpu_blocks-1)
+  - `ref_cnt`: 引用计数 (可被多个请求共享)
+  - `_block_hash`: 缓存的哈希值 (仅在 block 已满且已缓存时)
+  - `is_null`: 跳过 block 的标记 (滑动窗口注意力用)
+  - 用于空闲 block 队列的双向链表指针
+
+- **`FreeKVCacheBlockQueue`**: 空闲 block 的双向链表
+  - 按驱逐优先级 (LRU) 排序
+  - O(1) 从中间移除
+  - 非阻塞操作以提高性能
+
+#### 2. KVCacheManager (`vllm/v1/core/kv_cache_manager.py`)
+
+**核心职责**: 高级 KV cache 管理和调度器与 block pool 之间的桥梁。
+
+**主要类**:
+
+- **`KVCacheBlocks`**: 调度器与 KVCacheManager 之间的接口
+  - 封装每个 KV cache 组分配的 blocks
+  - `get_block_ids()`: 提取 block IDs
+  - `get_unhashed_block_ids()`: 获取非缓存的 blocks
+
+- **`KVCacheManager`**: 高级 KV cache 管理
+  - `get_computed_blocks(request)`: 查找请求的缓存 blocks (前缀缓存命中)
+  - `allocate_slots(request, num_new_tokens, ...)`: 为新/续接 tokens 分配 blocks
+  - `free(request)`: 释放请求的 blocks
+  - `cache_blocks(req_to_blocks)`: 缓存已计算的 blocks
+  - `evict_blocks(block_ids)`: 显式驱逐 blocks
+  - `reset_prefix_cache()`: 重置所有缓存状态
+  - `get_num_common_prefix_blocks(reqs)`: 查找请求间的共享前缀
+
+**前缀缓存关键方法**:
+
+```python
+get_computed_blocks(request):
+    # 查找最长缓存命中前缀
+    # 返回: (cached_blocks, num_cached_tokens)
+    # 如果 enable_caching=False 或 request.skip_reading_prefix_cache=True 则跳过
+
+allocate_slots(request, num_new_tokens, ...):
+    # 三阶段分配:
+    # 1. 释放不必要的 blocks (滑动窗口)
+    # 2. 处理前缀缓存命中 (touch blocks)
+    # 3. 为未缓存 tokens 分配新 blocks
+    # 分配后缓存完整的 blocks
 ```
 
-**对外接口**:
+#### 3. KVCacheCoordinator (`vllm/v1/core/kv_cache_coordinator.py`)
+
+**核心职责**: 多 KV cache 组协调,支持混合注意力模型。
+
+**主要类**:
+
+- **`KVCacheCoordinator`** (ABC): 多组支持的协调器基类
+- **`KVCacheCoordinatorNoPrefixCache`**: 无缓存支持的协调器
+- **`UnitaryKVCacheCoordinator`**: 单 KV cache 组 (大多数模型)
+- **`HybridKVCacheCoordinator`**: 多 KV cache 类型 (如混合注意力)
+
+**关键方法**:
+
+- `find_longest_cache_hit(...)`: 跨 KV 组查找最长前缀匹配
+- `allocate_new_computed_blocks(...)`: 处理缓存命中的 blocks
+- `cache_blocks(req_to_blocks)`: 计算后缓存完整 blocks
+- `get_num_common_prefix_blocks(reqs)`: 计算共享前缀长度
+
+**特殊逻辑**:
+
+- **Unitary**: 单组的简单基于哈希的查找
+- **Hybrid**: 多注意力类型的迭代固定点算法
+  - 检查每种注意力类型 (full, sliding window, chunked local)
+  - 减少候选长度直到所有类型一致
+  - 确保跨组的 block 对齐
+
+#### 4. SingleTypeKVCacheManager (`vllm/v1/core/single_type_kv_cache_manager.py`)
+
+**核心职责**: 每种注意力类型的专门缓存逻辑。
+
+**管理器类**:
+
+1. **`FullAttentionManager`**: 标准完整注意力缓存
+   - 从左到右缓存命中搜索
+   - 通过 `ref_cnt == len(req_to_blocks)` 检测公共前缀
+
+2. **`SlidingWindowManager`**: 滑动窗口注意力
+   - 从右到左搜索窗口内的连续 blocks
+   - 跳过窗口外的 tokens 的 (null) blocks
+   - 返回 `[NULL, NULL, cached_block, ...]` 模式
+
+3. **`ChunkedLocalAttentionManager`**: 局部注意力分块
+   - 将当前 chunk 外的所有 blocks 标记为 NULL
+   - 仅缓存 attention 窗口内的 blocks
+
+4. **`MambaManager`**: 线性注意力 (Mamba/SSM)
+   - 从右到左搜索最后匹配的 block
+   - 仅保留最后计算 token 的状态
+
+5. **`SinkFullAttentionManager`**: Sink token + 完整注意力
+   - 预分配永不驱逐的 sink blocks
+
+**关键方法**:
 ```python
-class BlockPool:
-    def get_cached_block(
-        self,
-        block_hash: BlockHash,
-        kv_cache_group_ids: list[int],
-    ) -> list[KVCacheBlock] | None:
-        """根据哈希获取缓存的块(支持多组)"""
-
-    def cache_full_blocks(
-        self,
-        request: Request,
-        blocks: list[KVCacheBlock],
-        num_cached_blocks: int,
-        num_full_blocks: int,
-        block_size: int,
-        kv_cache_group_id: int,
-    ) -> None:
-        """更新块的哈希元数据并缓存到哈希表"""
-
-    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
-        """从空闲队列获取新块,自动驱逐缓存块"""
-
-    def free_blocks(self, blocks: Iterable[KVCacheBlock]) -> None:
-        """释放块,减少引用计数,ref_cnt=0 时加入空闲队列"""
-
-    def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
-        """增加块的引用计数,防止被驱逐"""
-
-    def reset_prefix_cache(self) -> bool:
-        """清空所有缓存(用于 RLHF/benchmarking)"""
+@classmethod
+find_longest_cache_hit(
+    block_hashes, max_length, kv_cache_group_ids,
+    block_pool, kv_cache_spec, ...
+) -> list[KVCacheBlock]:
+    # 返回匹配前缀哈希链的缓存 blocks
+    # 处理对齐、滑动窗口、分块
 ```
 
 #### 5. KVCacheUtils (`vllm/v1/core/kv_cache_utils.py`)
 
-**主要功能**: 提供块哈希计算和工具函数。
+**核心职责**: Block 哈希、元数据结构和工具函数。
 
-**核心类型**:
+**Block 哈希**:
+
+- **`BlockHash`**: 类型别名,用于 bytes (token block 的哈希)
+- **`BlockHashWithGroupId`**: 将哈希 + group_id 组合成键
+- **`hash_block_tokens()`: 使用 parent_hash + token_ids + extra_keys 计算哈希
+  - 支持多模态输入 (mm_hash + offset)
+  - 支持 LoRA (lora_name)
+  - 支持特定请求变体的 cache_salt
+  - 使用 `sha256_cbor` 或 `xxhash_cbor` 实现可重现性
+
+**Block 元数据**:
+
+- **`KVCacheBlock`**: Block 元数据 (见 BlockPool 部分)
+
+**空闲 Block 队列**:
+
+- **`FreeKVCacheBlockQueue`**: 空闲 blocks 的双向链表 (见 BlockPool 部分)
+
+#### 6. Scheduler (`vllm/v1/core/sched/scheduler.py`)
+
+**核心职责**: 请求调度和缓存命中检测的集成点。
+
+**缓存集成**:
+
 ```python
-BlockHash = NewType("BlockHash", bytes)  # 单个块的哈希
-BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)  # 带 KV cache 组 ID
-BlockHashList = list[BlockHash]  # 块哈希列表
+# 请求调度期间
+computed_blocks, num_cached_tokens = kv_cache_manager.get_computed_blocks(request)
+# 更新 request.num_cached_tokens
+# 在 prefix_cache_stats 中记录指标
 ```
 
-**哈希函数**:
-```python
-def hash_block_tokens(
-    hash_function: Callable[[Any], bytes],
-    parent_block_hash: BlockHash | None,
-    curr_block_token_ids: Sequence[int],
-    extra_keys: tuple[Any, ...] | None = None,
-) -> BlockHash:
-    """计算单个块的哈希值
-    Args:
-        parent_block_hash: 父块哈希(用于链式哈希)
-        curr_block_token_ids: 当前块的 token IDs
-        extra_keys: 额外上下文(LoRA、多模态等)
-    Returns:
-        块哈希值
-    """
+**分配流程**:
 
-def get_request_block_hasher(
-    block_size: int,
-    caching_hash_fn: Callable[[Any], bytes],
-) -> Callable[[Request], list[BlockHash]]:
-    """返回请求的块哈希计算函数
-    - 只计算完整块
-    - 处理多模态输入和 LoRA
-    - 支持增量计算(只计算新完成的块)
-    """
-```
+1. 检查前缀缓存命中 → `get_computed_blocks()`
+2. 为新 tokens 分配 slots → `allocate_slots()`
+3. 缓存新计算的 blocks → `cache_blocks()`
+4. 完成时释放 → `free()`
 
-**特殊块**:
-- **NONE_HASH**: 根块的随机种子哈希
-- **null_block**: 永不缓存的占位块(用于滑动窗口跳过的块)
+**统计收集**:
+
+- `PrefixCacheStats`: 跟踪请求、查询 (tokens)、命中
+- `CachingMetrics`: 最近 N 个请求的滚动命中率
+- 区分新请求与被抢占的请求
+
+#### 7. Worker BlockTable (`vllm/v1/worker/block_table.py`)
+
+**核心职责**: Worker 端 block 表管理,将 block IDs 映射到 attention kernels 的 slots。
+
+**主要类**:
+
+- **`BlockTable`**: 将 token 位置映射到物理 blocks
+  - 将 block IDs 转换为 attention kernels 的 slot 映射
+  - 处理混合 block 大小 (allocation vs. kernel blocks)
+
+- **`MultiGroupBlockTable`**: 混合注意力的多个 block 表
+  - 每个 KV cache 组的独立表
+  - 跨组的同步操作
 
 ## 主要流程
 
-Prefix Caching 的完整生命周期流程如下:
-
-```mermaid
-graph TD
-    A[请求到达] --> B[创建 Request 对象]
-    B --> C[计算块哈希<br/>get_request_block_hasher]
-    C --> D[调度器调用<br/>get_computed_blocks]
-
-    D --> E{启用 Prefix Cache?}
-    E -->|否| F[返回空缓存]
-    E -->|是| G[find_longest_cache_hit]
-
-    G --> H[遍历块哈希<br/>从右到左查找]
-    H --> I[BlockPool.get_cached_block]
-    I --> J{哈希命中?}
-    J -->|是| K[记录缓存块]
-    J -->|否| L[停止查找]
-    K --> H
-    L --> M[返回缓存块<br/>和命中 token 数]
-
-    M --> N[调度器调用<br/>allocate_slots]
-    N --> O[计算需要分配的块数]
-    O --> P[分配新块<br/>BlockPool.get_new_blocks]
-
-    P --> Q[触及缓存块<br/>BlockPool.touch]
-    Q --> R[插入跳过的块<br/>null_block]
-
-    R --> S[模型执行<br/>计算未命中 tokens]
-
-    S --> T[调用 cache_blocks<br/>缓存完整块]
-    T --> U[BlockPool.cache_full_blocks]
-    U --> V[更新块元数据<br/>block_hash]
-    V --> W[插入哈希表<br/>cached_block_hash_to_block]
-
-    W --> X[请求完成]
-    X --> Y[释放资源<br/>KVCacheManager.free]
-    Y --> Z[减少引用计数<br/>ref_cnt--]
-    Z --> AA{ref_cnt == 0?}
-    AA -->|是| BB[加入空闲队列<br/>LRU 位置]
-    AA -->|否| AC[保留缓存]
-
-    BB --> AD{内存压力?}
-    AD -->|是| AE[LRU 驱逐<br/>_maybe_evict_cached_block]
-    AD -->|否| AF[保留在缓存中]
-    AE --> AF
-```
-
-### 详细流程步骤
-
-#### 阶段 1: 请求初始化和哈希计算
+### 1. 前缀缓存命中流程
 
 ```
-1. 用户请求到达 → 创建 Request 对象
-   ↓
-2. get_request_block_hasher() 生成初始块哈希
-   - 将 prompt tokens 按 block_size 分块
-   - 计算每个完整块的哈希: hash(parent_hash, block_tokens, extra_keys)
-   - extra_keys 包括: LoRA ID、多模态输入、cache_salt
-   ↓
-3. Request.block_hashes 存储初始哈希列表
-   - 例如: [hash0, hash1, hash2] (假设有 3 个完整块)
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   New Request│     │   Scheduler  │     │KVCacheManager│     │  BlockPool   │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │                    │
+       │  schedule()        │                    │                    │
+       │───────────────────>│                    │                    │
+       │                    │                    │                    │
+       │                    │  get_computed_blocks(req)                │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │                    │  find_longest_cache_hit()
+       │                    │                    │  - Compute block hashes
+       │                    │                    │  - Lookup in hash table
+       │                    │                    │───────────────────>│
+       │                    │                    │                    │
+       │                    │                    │                    │  get_cached_block(hash, group_id)
+       │                    │                    │                    │  - Check BlockHashToBlockMap
+       │                    │                    │                    │<───────────────────│
+       │                    │                    │                    │
+       │                    │                    │  Return cached blocks
+       │                    │                    │<───────────────────│
+       │                    │                    │                    │
+       │                    │  (cached_blocks, num_cached_tokens)      │
+       │                    │<───────────────────│                    │
+       │                    │                    │                    │
+       │                    │  Update request.num_cached_tokens        │
+       │                    │  Record prefix cache hit metrics         │
+       │                    │                    │                    │
+       │  Schedule request  │                    │                    │
+       │<───────────────────│                    │                    │
+       │                    │                    │                    │
 ```
 
-#### 阶段 2: 缓存命中检测
+### 2. Block 分配流程 (缓存命中 + 新计算)
 
 ```
-4. Scheduler 调用 KVCacheManager.get_computed_blocks(request)
-   ↓
-5. KVCacheCoordinator.find_longest_cache_hit(block_hashes, max_length)
-   ↓
-6. 对于单一 KV cache 组 (UnitaryKVCacheCoordinator):
-   - 直接调用 SingleTypeKVCacheManager.find_longest_cache_hit
-   ↓
-7. 对于混合 KV cache 组 (HybridKVCacheCoordinator):
-   - 使用迭代固定点算法
-   - 对每种注意力类型查找缓存命中
-   - 取所有类型的最小公共长度
-   ↓
-8. FullAttentionManager.find_longest_cache_hit 实现:
-   从右到左遍历块哈希:
-   for i in range(max_num_blocks - 1, -1, -1):
-       if cached_block := block_pool.get_cached_block(block_hashes[i]):
-           hit_blocks.append(cached_block)
-       else:
-           break  # 停止查找
-   ↓
-9. 返回 (hit_blocks, num_hit_tokens)
-   - hit_blocks: KVCacheBlock[] 数组
-   - num_hit_tokens = len(hit_blocks) * block_size
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Scheduler  │     │KVCacheManager│     │  BlockPool   │     │    Worker    │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │                    │
+       │  allocate_slots()  │                    │                    │
+       │───────────────────>│                    │                    │
+       │                    │                    │                    │
+       │                    │  Stage 1: Free unnecessary blocks        │
+       │                    │  (sliding window)                        │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │  Stage 2: Handle prefix cache hit        │
+       │                    │  - Touch cached blocks (inc ref_cnt)      │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │  Stage 3: Allocate new blocks            │
+       │                    │  for uncached tokens                     │
+       │                    │───────────────────>│                    │
+       │                    │                    │  get_new_blocks()  │
+       │                    │                    │  - Check free pool │
+       │                    │                    │  - Evict LRU if    │
+       │                    │                    │    insufficient    │
+       │                    │                    │<───────────────────│
+       │                    │                    │                    │
+       │                    │  Allocate slots for new tokens           │
+       │                    │<───────────────────│                    │
+       │                    │                    │                    │
+       │  Allocated blocks  │                    │                    │
+       │<───────────────────│                    │                    │
+       │                    │                    │                    │
+       │  Execute model     │                    │                    │
+       │───────────────────────────────────────────────────────────>│
+       │                    │                    │                    │
+       │                    │                    │  After computation │
+       │                    │                    │                    │
+       │                    │  cache_full_blocks()                    │
+       │                    │  - Hash new blocks                       │
+       │                    │  - Insert into hash table                │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
 ```
 
-#### 阶段 3: 块分配
+### 3. 缓存驱逐流程 (LRU)
 
 ```
-10. Scheduler 调用 KVCacheManager.allocate_slots()
-    ↓
-11. KVCacheCoordinator.get_num_blocks_to_allocate()
-    - 考虑已缓存的块
-    - 考虑跳过的块(滑动窗口)
-    - 考虑外部计算块(KV connector)
-    ↓
-12. KVCacheCoordinator.allocate_new_computed_blocks()
-    - BlockPool.touch(hit_blocks): 增加引用计数
-    - 插入跳过的块: [null_block, null_block, ...]
-    - 分配外部计算块: BlockPool.get_new_blocks()
-    ↓
-13. BlockPool.get_new_blocks(num_blocks):
-    - 从 free_block_queue 弹出块
-    - 如果块有 block_hash,自动驱逐
-    - 增加 ref_cnt
-    ↓
-14. 返回 KVCacheBlocks 给 Scheduler
-    - 包含: [null_block, ..., cached_block1, cached_block2, ..., new_block1, ...]
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Request    │     │  BlockPool   │     │FreeBlockQueue│
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │
+       │  get_new_blocks()  │                    │
+       │───────────────────>│                    │
+       │                    │                    │
+       │                    │  Check free pool   │
+       │                    │  Insufficient blocks│
+       │                    │                    │
+       │                    │  Need to evict     │
+       │                    │───────────────────>│
+       │                    │                    │
+       │                    │                    │  Pop from head
+       │                    │                    │  (oldest block)
+       │                    │                    │
+       │                    │  Remove from       │
+       │                    │  BlockHashToBlockMap│
+       │                    │<───────────────────│
+       │                    │                    │
+       │  Allocate evicted  │                    │
+       │  block to request  │                    │
+       │<───────────────────│                    │
+       │                    │                    │
+       │                    │                    │
+       │  Request completes │                    │
+       │───────────────────>│                    │
+       │                    │                    │
+       │                    │  free_blocks()     │
+       │                    │  - Decrease ref_cnt│
+       │                    │  - If ref_cnt == 0:│
+       │                    │    Add to tail of  │
+       │                    │    free queue      │
+       │                    │───────────────────>│
+       │                    │                    │
+       │                    │                    │
+       │  Request completes │                    │
+       │───────────────────>│                    │
+       │                    │  free_blocks()     │
+       │                    │  - Decrease ref_cnt│
+       │                    │  - If ref_cnt > 0: │
+       │                    │    Keep (still     │
+       │                    │    shared)         │
+       │                    │                    │
 ```
 
-#### 阶段 4: 模型执行
+### 4. 多轮对话缓存复用流程
 
 ```
-15. Scheduler 执行模型前向传播
-    - 使用分配的 KV cache 块
-    - 只计算未命中的 tokens
-    - 新计算的 KV 写入新分配的块
-    ↓
-16. 当块被填满时 (token_count % block_size == 0):
-    - 请求生成新的块哈希: request.get_hash_new_full_blocks()
-    - 扩展 request.block_hashes 列表
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  User        │     │   Scheduler  │     │KVCacheManager│     │  BlockPool   │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │                    │
+       │  Round 1:          │                    │                    │
+       │  "Hello, how are   │                    │                    │
+       │   you?"            │                    │                    │
+       │───────────────────>│                    │                    │
+       │                    │                    │                    │
+       │                    │  No cache hit      │                    │
+       │                    │  (first request)   │                    │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │                    │  Allocate & compute│
+       │                    │                    │───────────────────>│
+       │                    │                    │                    │
+       │  "I'm doing great!"│                    │                    │
+       │<───────────────────│                    │                    │
+       │                    │                    │                    │
+       │                    │  Cache all blocks  │                    │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       ├────────────────────────────────────────────────────────────────┤
+       │                    │                    │                    │
+       │  Round 2:          │                    │                    │
+       │  "Tell me a joke"  │                    │                    │
+       │───────────────────>│                    │                    │
+       │                    │                    │                    │
+       │                    │  Cache hit!        │                    │
+       │                    │  (reuse conversation│                   │
+       │                    │   history)         │                    │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │                    │  Touch cached blocks│
+       │                    │                    │  (inc ref_cnt)     │
+       │                    │                    │───────────────────>│
+       │                    │                    │                    │
+       │                    │  Only compute new  │                    │
+       │                    │  "Tell me a joke"   │                    │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │  "Why did the      │                    │                    │
+       │   chicken..."      │                    │                    │
+       │<───────────────────│                    │                    │
+       │                    │                    │                    │
 ```
 
-#### 阶段 5: 缓存更新
+### 5. 混合注意力协调流程
 
 ```
-17. Scheduler 调用 KVCacheManager.cache_blocks(request, num_tokens)
-    ↓
-18. SingleTypeKVCacheManager.cache_blocks()
-    - num_full_blocks = num_tokens // block_size
-    - num_cached_blocks = self.num_cached_block[request_id]
-    - 只缓存新完成的块
-    ↓
-19. BlockPool.cache_full_blocks():
-    for i, blk in enumerate(new_full_blocks):
-        if blk.is_null: continue  # 跳过 null blocks
-        block_hash = request.block_hashes[i]
-        block_hash_with_group_id = make_block_hash_with_group_id(
-            block_hash, kv_cache_group_id
-        )
-        blk.block_hash = block_hash_with_group_id
-        self.cached_block_hash_to_block.insert(block_hash_with_group_id, blk)
-    ↓
-20. 更新 self.num_cached_block[request_id] = num_full_blocks
-```
-
-#### 阶段 6: 请求完成和释放
-
-```
-21. 请求完成 → KVCacheManager.free(request_id)
-    ↓
-22. SingleTypeKVCacheManager.free():
-    - 获取请求的所有块: req_to_blocks[request_id]
-    - **反向**释放: reversed(req_blocks)
-    - BlockPool.free_blocks(blocks_reversed)
-    ↓
-23. BlockPool.free_blocks():
-    for block in blocks:
-        block.ref_cnt -= 1
-        if block.ref_cnt == 0:
-            free_block_queue.append(block)
-            # 块进入 LRU 队列尾部
-            # 如果 block_hash 存在,保留在哈希表中
-    ↓
-24. 清理请求数据:
-    - del req_to_blocks[request_id]
-    - del num_cached_block[request_id]
-```
-
-#### 阶段 7: LRU 驱逐
-
-```
-25. 当需要新块但空闲队列不足时:
-    BlockPool.get_new_blocks() 调用 _maybe_evict_cached_block()
-    ↓
-26. _maybe_evict_cached_block(block):
-    if block.block_hash is not None:
-        # 从哈希表移除
-        self.cached_block_hash_to_block.remove(block.block_hash, block)
-        block.reset_hash()
-        return True  # 已驱逐
-    ↓
-27. 块被分配给新请求
-    - ref_cnt 设置为 1
-    - 如果原缓存有多个引用,其他请求仍可使用
-```
-
-### 特殊场景
-
-#### 滑动窗口注意力
-
-```
-SlidingWindowManager.find_longest_cache_hit():
-  滑动窗口大小 = 8, block_size = 4
-  Tokens:    [0  1  2  3 | 4  5  6  7 | 8  9 10 11 | 12 13 14 15]
-  Blocks:     [----blk0----|----blk1----|----blk2----|----blk3----]
-  当 num_computed_tokens = 16:
-  - 窗口覆盖 tokens 9-15
-  - tokens 0-7 在窗口外,应跳过
-  - 返回: [null_block, null_block, cached_blk2, cached_blk3]
-  - num_skipped_tokens = 9
-```
-
-#### 混合注意力模型
-
-```
-HybridKVCacheCoordinator.find_longest_cache_hit():
-  模型有 2 种注意力类型:
-  - Layers 0-20: Full Attention (block_size=16)
-  - Layers 21-40: Sliding Window (block_size=16)
-
-  迭代固定点算法:
-  1. initial_length = 15
-  2. Full Attention.find_longest_cache_hit() → 12 tokens (命中 3 个块)
-  3. SlidingWindow.find_longest_cache_hit(max=12) → 8 tokens (窗口限制)
-  4. 重复直到收敛
-  最终返回: length = 8, blocks = [...]
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Scheduler  │     │  Coordinator │     │   FullAttn   │     │SlidingWindow │
+└──────┬───────┘     └──────┬───────┘     └──────┬───────┘     └──────┬───────┘
+       │                    │                    │                    │
+       │  find_longest_     │                    │                    │
+       │  cache_hit()       │                    │                    │
+       │───────────────────>│                    │                    │
+       │                    │                    │                    │
+       │                    │  Check each attention type            │
+       │                    │───────────────────>│                    │
+       │                    │                    │                    │
+       │                    │                    │  Find longest match│
+       │                    │                    │  (left-to-right)   │
+       │                    │                    │  Returns: 10 blocks│
+       │                    │                    │<───────────────────│
+       │                    │                    │                    │
+       │                    │───────────────────>│                    │
+       │                    │                    │  Find longest match│
+       │                    │                    │  (right-to-left)   │
+       │                    │                    │  Returns: 8 blocks  │
+       │                    │                    │<───────────────────│
+       │                    │                    │                    │
+       │                    │  Iterative fixed-point:                │
+       │                    │  - Full provides initial bound: 10     │
+       │                    │  - SlidingWindow bound: 8              │
+       │                    │  - Reduce to min: 8 blocks             │
+       │                    │  - Re-verify all types agree on 8      │
+       │                    │                    │
+       │  Return agreed     │                    │                    │
+       │  prefix length: 8  │                    │                    │
+       │<───────────────────│                    │                    │
+       │                    │                    │                    │
 ```
 
 ## 相关代码
 
 ### 核心文件列表
 
-| 文件路径 | 行数估算 | 主要内容 |
-|---------|---------|---------|
-| `vllm/v1/core/kv_cache_manager.py` | ~300 | KVCacheManager 主接口 |
-| `vllm/v1/core/kv_cache_coordinator.py` | ~600 | KVCacheCoordinator 及子类 |
-| `vllm/v1/core/single_type_kv_cache_manager.py` | ~900 | 各种注意力类型的管理器 |
-| `vllm/v1/core/block_pool.py` | ~500 | BlockPool 和 KVCacheBlock |
-| `vllm/v1/core/kv_cache_utils.py` | ~800 | 块哈希计算和工具函数 |
-| `vllm/v1/kv_cache_interface.py` | ~400 | KVCacheConfig 和规格定义 |
-| `vllm/config/cache.py` | ~200 | CacheConfig 配置类 |
-| `vllm/v1/request.py` | ~300 | Request 类(包含 block_hashes) |
+| 文件路径 | 主要类/函数 | 功能描述 |
+|---------|-----------|---------|
+| `vllm/v1/core/block_pool.py` | `BlockPool`, `BlockHashToBlockMap`, `KVCacheBlock`, `FreeKVCacheBlockQueue` | 核心 block 管理、哈希表、LRU 驱逐 |
+| `vllm/v1/core/kv_cache_manager.py` | `KVCacheManager`, `KVCacheBlocks` | 高级 KV cache 管理和调度器接口 |
+| `vllm/v1/core/kv_cache_coordinator.py` | `UnitaryKVCacheCoordinator`, `HybridKVCacheCoordinator` | 多 KV cache 组协调 |
+| `vllm/v1/core/single_type_kv_cache_manager.py` | `FullAttentionManager`, `SlidingWindowManager`, `ChunkedLocalAttentionManager`, `MambaManager`, `SinkFullAttentionManager` | 注意力类型特定的缓存逻辑 |
+| `vllm/v1/core/kv_cache_utils.py` | `hash_block_tokens()`, `BlockHash`, `BlockHashWithGroupId`, `KVCacheBlock`, `FreeKVCacheBlockQueue` | Block 哈希、元数据结构、工具函数 |
+| `vllm/v1/core/sched/scheduler.py` | `Scheduler.get_computed_blocks()`, `PrefixCacheStats`, `CachingMetrics` | 请求调度和缓存命中检测 |
+| `vllm/v1/worker/block_table.py` | `BlockTable`, `MultiGroupBlockTable` | Worker 端 block 表管理 |
+| `vllm/v1/engine/llm_engine.py` | `LLMEngine` (enable_prefix_caching 参数) | 引擎配置和初始化 |
 
-### 关键数据结构
+### 关键代码位置
+
+#### 1. 前缀缓存启用检查
+
+**文件**: `vllm/v1/core/kv_cache_manager.py`
 
 ```python
-# vllm/v1/core/kv_cache_utils.py
-@dataclass
-class KVCacheBlock:
-    block_id: int                           # 块 ID (0 到 num_gpu_blocks-1)
-    ref_cnt: int = 0                        # 引用计数
-    _block_hash: BlockHashWithGroupId | None  # 缓存哈希
-    prev_free_block: "KVCacheBlock | None"  # LRU 链表前驱
-    next_free_block: "KVCacheBlock | None"  # LRU 链表后继
-    is_null: bool = False                   # 是否为占位块
+def get_computed_blocks(self, req: SchedulerRequest) -> list[int]:
+    """Find cached blocks for a request (prefix cache hit)."""
+    # Skip if caching disabled or request-specific skip flag set
+    if not self.enable_caching or req.skip_reading_prefix_cache:
+        return []
 
-# vllm/v1/core/kv_cache_manager.py
-@dataclass
-class KVCacheBlocks:
-    blocks: tuple[Sequence[KVCacheBlock], ...]  # [group0_blocks, group1_blocks, ...]
-    # blocks[i][j] = 第 i 个 KV cache 组的第 j 个块
+    # Find longest cache hit via coordinator
+    computed_blocks = self.kv_cache_coordinator.find_longest_cache_hit(
+        req.block_hashes,
+        req.num_tokens,
+        req.kv_cache_group_ids,
+        self.block_pool,
+        self.kv_cache_spec,
+    )
+
+    # Update request metrics
+    req.num_cached_tokens = len(computed_blocks) * self.block_size
+    ...
 ```
 
-### 关键函数索引
+#### 2. Block 哈希计算
 
-| 函数名 | 文件 | 行号 | 功能 |
-|--------|------|------|------|
-| `get_computed_blocks()` | `kv_cache_manager.py` | ~164 | 获取缓存命中块 |
-| `find_longest_cache_hit()` | `single_type_kv_cache_manager.py` | ~393 | 查找最长前缀(Full Attention) |
-| `find_longest_cache_hit()` | `single_type_kv_cache_manager.py` | ~463 | 查找最长前缀(Sliding Window) |
-| `hash_block_tokens()` | `kv_cache_utils.py` | ~525 | 计算块哈希 |
-| `get_request_block_hasher()` | `kv_cache_utils.py` | ~555 | 生成请求哈希函数 |
-| `cache_full_blocks()` | `block_pool.py` | ~209 | 缓存完整块 |
-| `get_cached_block()` | `block_pool.py` | ~187 | 根据哈希获取缓存块 |
-| `get_new_blocks()` | `block_pool.py` | ~299 | 分配新块 |
-| `free_blocks()` | `block_pool.py` | ~367 | 释放块 |
-| `touch()` | `block_pool.py` | ~381 | 增加引用计数 |
-| `_maybe_evict_cached_block()` | `block_pool.py` | ~331 | 驱逐缓存块 |
+**文件**: `vllm/v1/core/kv_cache_utils.py`
+
+```python
+def hash_block_tokens(
+    block_hash: BlockHash,
+    token_ids: list[int],
+    extra_keys: tuple,
+) -> BlockHash:
+    """Compute hash for a block of tokens.
+
+    Args:
+        block_hash: Hash of parent block (for chain)
+        token_ids: Token IDs in current block
+        extra_keys: Extra hash components (mm_hash, lora_name, cache_salt)
+
+    Returns:
+        Hash of current block (includes parent hash for chain)
+    """
+    # Combine parent hash + tokens + extra keys
+    hash_data = (block_hash, tuple(token_ids), extra_keys)
+    # Use xxhash for speed or sha256 for reproducibility
+    return xxhash_cbor(hash_data)
+```
+
+#### 3. LRU 驱逐逻辑
+
+**文件**: `vllm/v1/core/block_pool.py`
+
+```python
+def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+    """Allocate new blocks from free pool, evicting if necessary."""
+    # Check if enough free blocks
+    if len(self.free_block_queue) < num_blocks:
+        # Need to evict blocks
+        num_to_evict = num_blocks - len(self.free_block_queue)
+        for _ in range(num_to_evict):
+            # Pop from head (oldest / least recently used)
+            block = self.free_block_queue.popleft()
+            # Remove from hash table
+            self.cached_block_hash_to_block.pop(block.block_hash, None)
+            # Reset block metadata
+            block.ref_cnt = 0
+            block._block_hash = None
+
+    # Allocate from free pool
+    blocks = [self.free_block_queue.popleft() for _ in range(num_blocks)]
+    return blocks
+```
+
+#### 4. 缓存命中时 Touch Block
+
+**文件**: `vllm/v1/core/block_pool.py`
+
+```python
+def touch(self, blocks: list[KVCacheBlock]) -> None:
+    """Increase block reference count (cache hit).
+
+    Removes blocks from free queue so they won't be evicted.
+    """
+    for block in blocks:
+        block.ref_cnt += 1
+        # Remove from free queue (if present)
+        if block in self.free_block_queue:
+            self.free_block_queue.remove(block)
+```
+
+#### 5. 不同注意力类型的缓存查找
+
+**文件**: `vllm/v1/core/single_type_kv_cache_manager.py`
+
+```python
+class FullAttentionManager:
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: tuple[int],
+        block_pool: BlockPool,
+        ...
+    ) -> list[KVCacheBlock]:
+        """Find longest prefix match for full attention.
+
+        Left-to-right search: find the longest chain of matching hashes.
+        """
+        computed_blocks = []
+        for block_hash in block_hashes[:max_length]:
+            cached_block = block_pool.get_cached_block(
+                block_hash, kv_cache_group_ids
+            )
+            if cached_block is None:
+                break  # Chain broken
+            computed_blocks.append(cached_block)
+        return computed_blocks
+
+
+class SlidingWindowManager:
+    @classmethod
+    def find_longest_cache_hit(
+        cls,
+        block_hashes: list[BlockHash],
+        max_length: int,
+        kv_cache_group_ids: tuple[int],
+        block_pool: BlockPool,
+        ...
+    ) -> list[KVCacheBlock]:
+        """Find longest prefix match for sliding window attention.
+
+        Right-to-left search: find contiguous blocks within window.
+        Returns [NULL, NULL, cached_block, ...] pattern for tokens
+        outside sliding window.
+        """
+        computed_blocks = []
+        window_size = kv_cache_spec.window_size
+
+        # Start from end, search backwards
+        for i in range(len(block_hashes) - 1, -1, -1):
+            block_hash = block_hashes[i]
+            cached_block = block_pool.get_cached_block(
+                block_hash, kv_cache_group_ids
+            )
+            if cached_block is None:
+                break  # Chain broken
+
+            # Prepend (building from right to left)
+            computed_blocks.insert(0, cached_block)
+
+            # Check if we have enough blocks for window
+            if len(computed_blocks) >= window_size:
+                break
+
+        # Pad with NULL blocks for tokens outside window
+        num_null_blocks = max_length - len(computed_blocks)
+        return [NULL_BLOCK] * num_null_blocks + computed_blocks
+```
+
+#### 6. 混合注意力协调
+
+**文件**: `vllm/v1/core/kv_cache_coordinator.py`
+
+```python
+class HybridKVCacheCoordinator:
+    def find_longest_cache_hit(
+        self,
+        block_hashes: dict[str, list[BlockHash]],  # Per attention type
+        max_length: int,
+        kv_cache_group_ids: dict[str, tuple[int]],  # Per attention type
+        ...
+    ) -> dict[str, list[KVCacheBlock]]:
+        """Find longest cache hit for hybrid attention.
+
+        Uses iterative fixed-point algorithm to ensure all
+        attention types agree on prefix length.
+        """
+        # Start with full attention bound (monotonic property)
+        full_blocks = self.managers["full"].find_longest_cache_hit(...)
+        candidate_length = len(full_blocks)
+
+        # Iteratively reduce until all types agree
+        for _ in range(len(self.managers)):
+            for attn_type, manager in self.managers.items():
+                blocks = manager.find_longest_cache_hit(
+                    block_hashes[attn_type][:candidate_length],
+                    candidate_length,
+                    ...
+                )
+                candidate_length = min(candidate_length, len(blocks))
+
+        # Return blocks for all types at agreed length
+        return {
+            attn_type: manager.find_longest_cache_hit(...)[
+                :candidate_length
+            ]
+            for attn_type, manager in self.managers.items()
+        }
+```
 
 ## 使用说明
 
-### 基本配置
+### 启用前缀缓存
 
-Prefix Caching 在 vLLM 中默认启用。基本用法:
+在 vLLM 引擎中设置 `enable_prefix_caching=True` 即可启用 APC:
+
+#### Python API
 
 ```python
 from vllm import LLM, SamplingParams
 
-# 创建 LLM 实例(Prefix Caching 默认启用)
+# Initialize LLM with prefix caching enabled
 llm = LLM(
     model="meta-llama/Llama-2-7b-chat-hf",
-    enable_prefix_caching=True,  # 显式启用(默认为 True)
+    enable_prefix_caching=True,  # Enable APC
+    gpu_memory_utilization=0.9,
 )
 
-# 第一次请求 - 计算 KV cache
-outputs = llm.generate(["Explain quantum computing in simple terms."],
-                       SamplingParams(max_tokens=100))
+# Generate with shared prefix
+prompts = [
+    "You are a helpful assistant. " + user_query_1,
+    "You are a helpful assistant. " + user_query_2,
+    # The system prompt prefix will be cached after first request
+    # and reused for all subsequent requests
+]
 
-# 第二次请求 - 自动复用前缀缓存(如果有共同前缀)
-outputs = llm.generate(["Explain quantum computing in detail."],
-                       SamplingParams(max_tokens=100))
+outputs = llm.generate(prompts, SamplingParams(temperature=0.8))
 ```
 
-### 高级配置选项
+#### OpenAI Compatible API Server
+
+```bash
+# Start server with prefix caching enabled
+python -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-7b-chat-hf \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.9
+```
+
+#### CLI
+
+```bash
+# Run with prefix caching
+vllm serve meta-llama/Llama-2-7b-chat-hf \
+    --enable-prefix-caching \
+    --gpu-memory-utilization 0.9
+```
+
+### 配置参数
+
+**相关配置参数**:
+
+- **`enable_prefix_caching`** (bool): 启用/禁用前缀缓存 (默认: `False`)
+- **`gpu_memory_utilization`** (float): GPU 内存利用率 (0.0-1.0), 影响 KV cache 大小
+- **`block_size`** (int): 每个 block 的 token 数量 (默认: 16)
+- **`max_num_batched_tokens`** (int): 最大批处理 token 数,影响内存分配
+
+### 监控和指标
+
+vLLM 提供前缀缓存的性能指标:
 
 ```python
 from vllm import LLM
-from vllm.config import CacheConfig
 
-# 自定义缓存配置
-cache_config = CacheConfig(
-    enable_prefix_caching=True,
-    prefix_caching_hash_algo="sha256",  # 哈希算法: "sha256" | "sha256_cbor" | "xxhash" | "xxhash_cbor"
-    block_size=16,                      # 块大小( tokens)
-    gpu_memory_utilization=0.9,         # GPU 内存利用率
-)
+llm = LLM(model="...", enable_prefix_caching=True)
 
-llm = LLM(
-    model="meta-llama/Llama-2-7b-chat-hf",
-    cache_config=cache_config,
-)
+# After serving requests, check metrics
+metrics = llm.get_prefix_cache_stats()
+print(f"Prefix cache hit rate: {metrics.hit_rate:.2%}")
+print(f"Total cached tokens: {metrics.total_cached_tokens}")
+print(f"Cache utilization: {metrics.cache_utilization:.2%}")
 ```
 
-### 哈希算法选择
+### 使用示例
 
-| 算法 | 安全性 | 性能 | 跨语言 | 适用场景 |
-|------|--------|------|--------|----------|
-| `sha256` | 高 | 中 | 否 | 默认,最高安全性 |
-| `sha256_cbor` | 高 | 中 | 是 | 需要跨语言复用缓存 |
-| `xxhash` | 中 | 高 | 否 | 性能优先,低风险环境 |
-| `xxhash_cbor` | 中 | 高 | 是 | 性能+跨语言需求 |
-
-**注意**: 在多租户环境中使用非加密哈希(xxhash)可能导致哈希碰撞风险。
-
-### 禁用 Prefix Caching
+#### 示例 1: 长文档问答
 
 ```python
-# 方法 1: 创建时禁用
-llm = LLM(
-    model="meta-llama/Llama-2-7b-chat-hf",
-    enable_prefix_caching=False,
-)
+from vllm import LLM, SamplingParams
 
-# 方法 2: 运行时重置缓存(用于 RLHF 或 benchmarking)
-llm.llm_engine.reset_prefix_cache()
-```
-
-### 监控和统计
-
-```python
-# 启用统计日志
+# Initialize with prefix caching
 llm = LLM(
     model="meta-llama/Llama-2-7b-chat-hf",
     enable_prefix_caching=True,
-    log_stats=True,  # 启用统计收集
+    max_model_len=4096,
 )
 
-# 执行推理...
-outputs = llm.generate(...)
+# Long document (will be cached after first query)
+document = """
+[Long document content, e.g., 2024 Annual Report...
+ approximately 3000 tokens...]
+"""
 
-# 获取 Prefix Cache 统计
-stats = llm.llm_engine.get_prefix_cache_stats()
-print(f"Cache hit rate: {stats.cache_hit_rate:.2%}")
-print(f"Total tokens: {stats.total_tokens}")
-print(f"Cached tokens: {stats.cached_tokens}")
+# Multiple queries on the same document
+queries = [
+    document + "\n\nQuestion: What was the revenue in Q4?",
+    document + "\n\nQuestion: Who is the CEO?",
+    document + "\n\nQuestion: What are the risk factors?",
+]
+
+# First request computes and caches the document
+# Subsequent requests reuse the cached document KV cache
+outputs = llm.generate(queries, SamplingParams(temperature=0.1))
 ```
 
-### 使用 OpenAI API
+**性能收益**:
+- 第一个请求: 处理完整文档 (3000 tokens)
+- 后续请求: 仅处理问题部分 (~20 tokens),节省 ~99% 的 prefill 时间
 
-```bash
-# 启动服务器(默认启用 Prefix Caching)
-vllm serve meta-llama/Llama-2-7b-chat-hf \
-    --enable-prefix-caching \
-    --prefix-caching-hash-algo sha256
-
-# 或通过配置文件
-vllm serve meta-llama/Llama-2-7b-chat-hf \
-    --config config.json
-```
-
-### 环境变量
-
-```bash
-# 设置 CBOR 哈希的随机种子(用于可重现性)
-export PYTHONHASHSEED=0
-
-# 启用 KV cache 事件(用于调试/监控)
-export VLLM_KV_CACHE_EVENTS=1
-
-# 使用整数块哈希(兼容性)
-export VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1
-```
-
-### 最佳实践
-
-1. **块大小选择**:
-   - 小块(16): 更细粒度缓存,但内存开销大
-   - 大块(256): 内存效率高,但缓存命中率可能降低
-   - 推荐: 16-32,根据典型请求长度调整
-
-2. **多轮对话**:
-   - 保持相同的 system prompt 以最大化缓存复用
-   - 使用 `cache_salt` 区分不同会话
-
-3. **RAG 应用**:
-   - 缓存常见文档的 KV cache
-   - 考虑使用 LMCache 进行持久化跨实例缓存
-
-4. **LoRA 模型**:
-   - 块哈希自动包含 LoRA ID
-   - 不同 LoRA 适配器的缓存不会冲突
-
-5. **内存管理**:
-   - 监控 `KVCacheManager.usage` 避免内存溢出
-   - 考虑使用 `cpu_offload_gb` 扩展缓存容量
-
-### 限制和注意事项
-
-1. **部分块不支持缓存**:
-   - 只有完整的块(block_size 个 tokens)才会被缓存
-   - 最后一个不完整的块不会被缓存
-
-2. **多模态输入**:
-   - 图像/音频输入会影响块哈希
-   - 仅当多模态特征完全相同时才能命中缓存
-
-3. **Cross Attention**:
-   - 编码器-解码器注意力不支持缓存共享
-   - 每个请求单独分配 cross-attention 块
-
-4. **EAGLE 投机解码**:
-   - 启用 EAGLE 时会丢弃最后一个缓存块
-   - 确保最后一个块被重新计算以获取 drafting head 的隐藏状态
-
-5. **分布式推理**:
-   - Context Parallel (DCP/PCP) 会增加块大小
-   - 确保所有进程使用相同的 `hash_block_size`
-
-### 故障排查
+#### 示例 2: 多轮对话
 
 ```python
-# 检查缓存状态
-print(f"KV cache usage: {llm.llm_engine.get_cache_usage():.2%}")
+from vllm import LLM, SamplingParams
 
-# 获取详细统计
-stats = llm.llm_engine.get_prefix_cache_stats()
-if stats:
-    print(f"Cache hits: {stats.num_cache_hits}")
-    print(f"Cache misses: {stats.num_cache_misses}")
+llm = LLM(model="...", enable_prefix_caching=True)
 
-# 重置缓存(如果出现异常)
-llm.llm_engine.reset_prefix_cache()
+conversation_history = []
+
+# Round 1
+user_msg_1 = "Hello, how are you?"
+conversation_history.append(f"User: {user_msg_1}")
+prompt_1 = "\n".join(conversation_history)
+output_1 = llm.generate([prompt_1], SamplingParams(...))[0]
+conversation_history.append(f"Assistant: {output_1.outputs[0].text}")
+
+# Round 2
+user_msg_2 = "Tell me a joke"
+conversation_history.append(f"User: {user_msg_2}")
+prompt_2 = "\n".join(conversation_history)
+output_2 = llm.generate([prompt_2], SamplingParams(...))[0]
+# The conversation history from Round 1 is automatically cached
+# and reused for Round 2, avoiding recomputation
 ```
 
-### 与 LMCache 集成
+**性能收益**:
+- 每轮对话自动复用之前轮次的 KV cache
+- 避免 recompute 整个对话历史
+- 显著降低 multi-turn 应用的延迟
 
-对于需要跨实例持久化缓存的高级场景,考虑使用 LMCache:
+#### 示例 3: RAG 应用
 
-```bash
-pip install lmcache
+```python
+from vllm import LLM, SamplingParams
 
-# LMCache 自动集成 vLLM 的 prefix caching
-# 提供 CPU/Disk/Remote 存储后端
-python -m lmcache.server --backend redis
+llm = LLM(model="...", enable_prefix_caching=True)
+
+# Fixed document context (cached after first request)
+document_context = """
+Context: [Retrieved document chunks from vector database...
+ approximately 1000 tokens...]
+"""
+
+# Multiple user queries with the same context
+queries = [
+    document_context + f"\n\nQuestion: {q1}",
+    document_context + f"\n\nQuestion: {q2}",
+    document_context + f"\n\nQuestion: {q3}",
+]
+
+# Document context is cached and reused across all queries
+outputs = llm.generate(queries, SamplingParams(temperature=0.1))
 ```
 
-LMCache 扩展了 vLLM 的 prefix caching 能力,支持:
-- 跨实例缓存共享
-- 持久化存储(NVMe/Redis/S3)
-- 分离式 Prefill-Decode 架构
-- 3-10x TTFT 降低(相比本地 prefix caching)
+**性能收益**:
+- 固定的文档上下文仅计算一次
+- 所有查询共享缓存的 document KV cache
+- 特别适合 high-QPS RAG 服务
+
+### 性能调优建议
+
+1. **内存分配**: 前缀缓存需要额外的 GPU 内存来维护 cached blocks。如果 OOM,可以降低 `gpu_memory_utilization` 或减少 `max_num_batched_tokens`。
+
+2. **Block 大小**: 较小的 block size (如 16) 提供更细粒度的缓存,但增加哈希开销。较大的 block size (如 32) 减少开销但降低缓存命中率。
+
+3. **缓存命中率监控**: 监控 `prefix_cache_hit_rate` 指标。如果命中率很低 (<30%),前缀缓存可能不适合当前 workload。
+
+4. **适用场景**:
+   - **适合**: 高 prefill/decode 比、高前缀复用率 (multi-turn chat, RAG, prompt engineering)
+   - **不适合**: 低前缀复用率、长生成 (答案 >> 问题)、随机 prompts
+
+### 已知限制
+
+1. **内存开销**: 维护 prefix cache 需要额外的 GPU 内存,可能减少可服务的并发请求数。
+
+2. **仅加速 Prefill**: APC 不加速 decode 阶段。对于长生成场景,收益有限。
+
+3. **哈希计算开销**: 计算 block hashes 需要额外 CPU 时间,但通常远小于 prefill 时间节省。
+
+4. **缓存污染**: 如果请求前缀差异很大,低命中率会导致频繁驱逐,反而降低性能。
+
+5. **动态 LoRA/多模态**: 不同 LoRA 适配器或多模态输入会导致不同的 hash,无法共享 cache。
+
+---
+
+**参考资源**:
+
+- [Automatic Prefix Caching - vLLM 官方文档](https://docs.vllm.ai/en/stable/features/automatic_prefix_caching/)
+- [Prefix Caching Design - vLLM 设计文档](https://docs.vllm.ai/en/stable/design/prefix_caching/)
+- [Understanding vLLM KV Cache - Community Discussion](https://discuss.vllm.ai/t/understanding-vllm-kv-cache/2061)
+- [vLLM Automatic Prefix Cache 原理&图解 - 知乎](https://zhuanlan.zhihu.com/p/693556044)
+- [Prefix Caching 详解 - AI Infra 教程](https://cr7258.github.io/courses/ai-infra/AI%20Infra%20教程/03-prefix-caching)
