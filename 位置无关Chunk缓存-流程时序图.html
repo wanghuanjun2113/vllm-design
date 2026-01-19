@@ -1,0 +1,1048 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>位置无关Chunk缓存 - 流程时序图</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .nav {
+            background: #f8f9fa;
+            padding: 20px 40px;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .nav ul {
+            list-style: none;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .nav a {
+            color: #667eea;
+            text-decoration: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            transition: all 0.3s;
+            font-weight: 500;
+        }
+
+        .nav a:hover {
+            background: #667eea;
+            color: white;
+        }
+
+        .content {
+            padding: 40px;
+        }
+
+        .section {
+            margin-bottom: 60px;
+        }
+
+        .section h2 {
+            color: #667eea;
+            font-size: 2em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+        }
+
+        .section h3 {
+            color: #764ba2;
+            font-size: 1.5em;
+            margin: 30px 0 15px 0;
+        }
+
+        .diagram-container {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 30px;
+            margin: 20px 0;
+            overflow-x: auto;
+            border: 1px solid #e9ecef;
+        }
+
+        .description {
+            background: #fff3cd;
+            border-left: 4px solid #ffc107;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        .description h4 {
+            color: #856404;
+            margin-bottom: 10px;
+        }
+
+        .description ul {
+            margin-left: 20px;
+        }
+
+        .description li {
+            margin: 8px 0;
+        }
+
+        .highlight {
+            background: #d1ecf1;
+            border-left: 4px solid #17a2b8;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+        }
+
+        .performance {
+            background: #d4edda;
+            border-left: 4px solid #28a745;
+            padding: 15px;
+            margin: 15px 0;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+
+        .step {
+            background: white;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+
+        .step-number {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            width: 30px;
+            height: 30px;
+            line-height: 30px;
+            text-align: center;
+            border-radius: 50%;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        table th {
+            background: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+        }
+
+        table td {
+            padding: 12px;
+            border-bottom: 1px solid #dee2e6;
+        }
+
+        table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .class-info {
+            background: #e7f3ff;
+            border: 1px solid #b8daff;
+            border-radius: 6px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+
+        .class-info code {
+            background: white;
+            padding: 2px 6px;
+            border-radius: 3px;
+            color: #667eea;
+            font-family: 'Courier New', monospace;
+        }
+
+        .footer {
+            background: #f8f9fa;
+            padding: 30px;
+            text-align: center;
+            color: #6c757d;
+            border-top: 1px solid #dee2e6;
+        }
+
+        pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            margin: 10px 0;
+        }
+
+        code {
+            font-family: 'Courier New', monospace;
+        }
+
+        .mermaid {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 400px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 位置无关Chunk缓存 - 流程时序图</h1>
+            <p>Position-Agnostic Chunk Cache - Sequence Diagrams</p>
+        </div>
+
+        <div class="nav">
+            <ul>
+                <li><a href="#overview">概述</a></li>
+                <li><a href="#flow1">流程1: 缓存未命中</a></li>
+                <li><a href="#flow2">流程2: 缓存命中</a></li>
+                <li><a href="#flow3">流程3: 位置编码处理</a></li>
+                <li><a href="#flow4">流程4: Attention Mask构建</a></li>
+                <li><a href="#classes">涉及的类</a></li>
+            </ul>
+        </div>
+
+        <div class="content">
+            <!-- 概述 -->
+            <div id="overview" class="section">
+                <h2>📋 概述</h2>
+
+                <div class="description">
+                    <h4>什么是位置无关Chunk缓存？</h4>
+                    <ul>
+                        <li><strong>位置无关缓存</strong>：Chunk hash仅基于token内容，不包含位置信息</li>
+                        <li><strong>虚拟位置计算</strong>：所有chunk在统一虚拟位置计算KV，使用时重映射到实际位置</li>
+                        <li><strong>Chunk隔离注意力</strong>：通过自定义attention mask实现chunk间的隔离</li>
+                        <li><strong>独立内存池</strong>：与主KV cache分离的chunk缓存池（默认2GB）</li>
+                    </ul>
+                </div>
+
+                <div class="performance">
+                    🎯 <strong>性能预期：</strong> 单个chunk缓存命中约12x加速（5ms vs 60ms）
+                </div>
+            </div>
+
+            <!-- 流程1：缓存未命中 -->
+            <div id="flow1" class="section">
+                <h2>🔄 流程1：缓存未命中 - 生成Chunk KV并缓存</h2>
+
+                <div class="description">
+                    <h4>场景描述</h4>
+                    <p>用户请求：<code>"You are helpful. # # Doc1 # # What?"</code></p>
+                    <p>这是第一次请求，所有chunk都需要计算并缓存。</p>
+                </div>
+
+                <h3>时序图</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant User
+    participant LLMEngine as LLMEngine
+    participant InputProcessor as InputProcessor<br/>(修改)
+    participant ChunkTokenParser as ChunkTokenParser<br/>(新增)
+    participant ChunkCacheEngine as ChunkCacheEngine<br/>(新增)
+    participant ChunkHashIndex as ChunkHashIndex<br/>(新增)
+    participant GPUModelRunner as GPUModelRunner<br/>(修改)
+    participant ChunkKVPool as ChunkKVPool<br/>(新增)
+    participant ChunkStorageManager as ChunkStorageManager<br/>(新增)
+    participant PositionRemapper as PositionRemapper<br/>(新增)
+    participant AttentionMaskBuilder as AttentionMaskBuilder<br/>(新增)
+    participant AscendSFABackend as AscendSFABackend<br/>(修改)
+
+    User->>LLMEngine: 1. 发送请求<br/>"You are helpful. # # Doc1 # # What?"
+    LLMEngine->>InputProcessor: 2. process_inputs()
+
+    Note over InputProcessor: 检测分隔符 " # # "
+    InputProcessor->>InputProcessor: 3. _detect_chunked_prompt()<br/>返回: True
+
+    InputProcessor->>ChunkTokenParser: 4. parse(tokens, " # # ")
+
+    Note over ChunkTokenParser: 解析chunked prompt
+    ChunkTokenParser->>ChunkTokenParser: 5. 分割token序列<br/>sys_prompt: [1,2,3]<br/>chunks: [[10,11,...,200]]<br/>question: [100,101]
+    ChunkTokenParser->>ChunkTokenParser: 6. 计算chunk_boundaries<br/>[(0,3), (3,203), (203,205)]
+    ChunkTokenParser-->>InputProcessor: 7. 返回 ChunkedPrompt
+
+    InputProcessor->>ChunkCacheEngine: 8. lookup(chunks)
+
+    loop 每个chunk
+        ChunkCacheEngine->>ChunkTokenParser: 9. compute_hash(chunk_tokens)
+        ChunkTokenParser-->>ChunkCacheEngine: 10. 返回 content_hash<br/>(XXHash128)
+
+        Note over ChunkCacheEngine: sys_prompt: hash_abc<br/>Doc1: hash_def
+        ChunkCacheEngine->>ChunkHashIndex: 11. lookup(hash_abc)
+        ChunkHashIndex-->>ChunkCacheEngine: 12. 返回 None [MISS]
+        ChunkCacheEngine->>ChunkHashIndex: 13. lookup(hash_def)
+        ChunkHashIndex-->>ChunkCacheEngine: 14. 返回 None [MISS]
+    end
+
+    ChunkCacheEngine-->>InputProcessor: 15. 返回 所有chunk未命中
+
+    InputProcessor->>GPUModelRunner: 16. get_or_compute_chunks(chunks)
+
+    loop 每个未命中的chunk
+        GPUModelRunner->>GPUModelRunner: 17. compute_chunk_kv()<br/>tokens=sys_prompt
+
+        Note over GPUModelRunner: 在虚拟位置计算KV
+        GPUModelRunner->>ChunkKVPool: 18. allocate(num_tokens)
+        ChunkKVPool-->>GPUModelRunner: 19. 返回 block_ids [100, 101]
+
+        GPUModelRunner->>GPUModelRunner: 20. 执行model.forward()<br/>position=[0, 3)<br/>应用虚拟位置RoPE
+
+        GPUModelRunner->>GPUModelRunner: 21. 创建 ChunkKV{<br/>chunk_key: ChunkKey(hash_abc),<br/>block_ids: [100, 101],<br/>virtual_position: [0, 3)<br/>}
+
+        GPUModelRunner->>ChunkCacheEngine: 22. store(hash_abc, chunk_kv)
+        ChunkCacheEngine->>ChunkStorageManager: 23. put(hash_abc, chunk_kv)
+        ChunkStorageManager-->>ChunkCacheEngine: 24. 存储成功
+        ChunkCacheEngine-->>GPUModelRunner: 25. 存储成功
+
+        Note over GPUModelRunner: 重复处理 Doc1 chunk<br/>compute_chunk_kv(tokens=Doc1)<br/>→ block_ids [102, 103, ...]
+    end
+
+    GPUModelRunner->>PositionRemapper: 26. remap(sys_prompt_kv, dst_position=0)
+
+    Note over PositionRemapper: 拷贝并重映射到实际位置
+    PositionRemapper->>ChunkKVPool: 27. allocate_main_kv(num_tokens)
+    ChunkKVPool-->>PositionRemapper: 28. 返回 main_block_ids [5000, 5001]
+
+    PositionRemapper->>PositionRemapper: 29. 拷贝 KV数据<br/>100→5000, 101→5001
+    PositionRemapper->>PositionRemapper: 30. 应用位置0的RoPE编码<br/>覆盖虚拟位置编码
+
+    PositionRemapper-->>GPUModelRunner: 31. 返回 RemappedChunkKV{<br/>block_ids: [5000, 5001],<br/>position: [0, 3)<br/>}
+
+    GPUModelRunner->>PositionRemapper: 32. remap(Doc1_kv, dst_position=3)
+
+    Note over PositionRemapper: 重复处理 Doc1
+    PositionRemapper->>ChunkKVPool: 33. allocate_main_kv(num_tokens)
+    ChunkKVPool-->>PositionRemapper: 34. 返回 [5002, 5003, ...]
+    PositionRemapper->>PositionRemapper: 35. 拷贝 KV + 应用位置3的RoPE
+
+    PositionRemapper-->>GPUModelRunner: 36. 返回 RemappedChunkKV{<br/>block_ids: [5002, 5003, ...],<br/>position: [3, 203)<br/>}
+
+    GPUModelRunner->>AttentionMaskBuilder: 37. get_chunk_aware_mask(<br/>chunk_boundaries,<br/>seq_len)
+
+    Note over AttentionMaskBuilder: 构建chunk隔离attention mask
+    AttentionMaskBuilder->>AttentionMaskBuilder: 38. 为每个token分配chunk_id<br/>sys_prompt: -1<br/>Doc1: 0<br/>question: -2
+
+    AttentionMaskBuilder->>AttentionMaskBuilder: 39. 构建attention mask矩阵<br/>sys_prompt: 标准causal<br/>Doc1: 可看sys_prompt+同chunk<br/>question: 可看所有
+
+    AttentionMaskBuilder-->>GPUModelRunner: 40. 返回 chunk_attn_mask
+
+    GPUModelRunner->>AscendSFABackend: 41. forward(<br/>query, key, value,<br/>chunk_attn_mask,<br/>remapped_kv_blocks)
+
+    Note over AscendSFABackend: 执行推理
+    AscendSFABackend->>AscendSFABackend: 42. 应用chunk-aware mask
+    AscendSFABackend->>AscendSFABackend: 43. 执行注意力计算
+    AscendSFABackend-->>GPUModelRunner: 44. 返回 hidden_states
+
+    GPUModelRunner->>GPUModelRunner: 45. 生成output tokens
+    GPUModelRunner-->>LLMEngine: 46. 返回生成结果
+    LLMEngine-->>User: 47. 返回最终输出
+                    </div>
+                </div>
+
+                <div class="description">
+                    <h4>关键步骤说明</h4>
+                    <div class="step">
+                        <span class="step-number">1</span>
+                        <strong>检测分隔符</strong>：InputProcessor检测到`# #`分隔符，判断为chunked prompt
+                    </div>
+                    <div class="step">
+                        <span class="step-number">2</span>
+                        <strong>解析chunked prompt</strong>：ChunkTokenParser将prompt分割为sys_prompt、chunks和question
+                    </div>
+                    <div class="step">
+                        <span class="step-number">3</span>
+                        <strong>哈希查找</strong>：对每个chunk计算内容哈希，在ChunkHashIndex中查找
+                    </div>
+                    <div class="step">
+                        <span class="step-number">4</span>
+                        <strong>计算Chunk KV</strong>：在虚拟位置计算chunk的KV cache
+                    </div>
+                    <div class="step">
+                        <span class="step-number">5</span>
+                        <strong>缓存Chunk KV</strong>：将计算好的chunk KV存储到ChunkStorageManager
+                    </div>
+                    <div class="step">
+                        <span class="step-number">6</span>
+                        <strong>重映射到实际位置</strong>：PositionRemapper拷贝KV并应用实际位置的RoPE编码
+                    </div>
+                    <div class="step">
+                        <span class="step-number">7</span>
+                        <strong>构建Attention Mask</strong>：生成chunk隔离的attention mask
+                    </div>
+                    <div class="step">
+                        <span class="step-number">8</span>
+                        <strong>执行推理</strong>：AscendSFABackend执行注意力计算并生成结果
+                    </div>
+                </div>
+
+                <div class="performance">
+                    ⏱️ <strong>性能分析：</strong> 缓存未命中时，总耗时约55ms（计算50ms + 拷贝5ms）
+                </div>
+            </div>
+
+            <!-- 流程2：缓存命中 -->
+            <div id="flow2" class="section">
+                <h2>✅ 流程2：缓存命中 - 拷贝拼接KV并推理</h2>
+
+                <div class="description">
+                    <h4>场景描述</h4>
+                    <p>用户请求：<code>"Different sys. # # Doc1 # # Tell me more"</code></p>
+                    <p>Doc1 chunk已经在缓存中，可以直接复用，无需重新计算！</p>
+                </div>
+
+                <h3>时序图</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant User
+    participant LLMEngine as LLMEngine
+    participant InputProcessor as InputProcessor<br/>(修改)
+    participant ChunkTokenParser as ChunkTokenParser<br/>(新增)
+    participant ChunkCacheEngine as ChunkCacheEngine<br/>(新增)
+    participant ChunkHashIndex as ChunkHashIndex<br/>(新增)
+    participant GPUModelRunner as GPUModelRunner<br/>(修改)
+    participant ChunkStorageManager as ChunkStorageManager<br/>(新增)
+    participant PositionRemapper as PositionRemapper<br/>(新增)
+    participant AttentionMaskBuilder as AttentionMaskBuilder<br/>(新增)
+    participant AscendSFABackend as AscendSFABackend<br/>(修改)
+
+    User->>LLMEngine: 1. 发送请求<br/>"Different sys. # # Doc1 # # Tell me more"
+    LLMEngine->>InputProcessor: 2. process_inputs()
+
+    InputProcessor->>InputProcessor: 3. _detect_chunked_prompt()<br/>返回: True
+
+    InputProcessor->>ChunkTokenParser: 4. parse(tokens, " # # ")
+
+    Note over ChunkTokenParser: 解析chunked prompt
+    ChunkTokenParser->>ChunkTokenParser: 5. 分割token序列<br/>sys_prompt: [5,6,7] (不同!)<br/>chunks: [[10,11,...,200]] (相同Doc1)<br/>question: [200,201]
+    ChunkTokenParser-->>InputProcessor: 6. 返回 ChunkedPrompt
+
+    InputProcessor->>ChunkCacheEngine: 7. lookup(chunks)
+
+    ChunkCacheEngine->>ChunkTokenParser: 8. compute_hash(sys_prompt)
+    ChunkTokenParser-->>ChunkCacheEngine: 9. 返回 hash_xyz
+
+    ChunkCacheEngine->>ChunkHashIndex: 10. lookup(hash_xyz)
+    ChunkHashIndex-->>ChunkCacheEngine: 11. 返回 None [MISS]
+
+    ChunkCacheEngine->>ChunkTokenParser: 12. compute_hash(Doc1)
+    ChunkTokenParser-->>ChunkCacheEngine: 13. 返回 hash_def
+
+    Note over ChunkCacheEngine,ChunkHashIndex: 关键：Doc1已经在缓存中！
+    ChunkCacheEngine->>ChunkHashIndex: 14. lookup(hash_def)
+    ChunkHashIndex-->>ChunkCacheEngine: 15. 返回 ChunkKV [HIT] ✓
+
+    ChunkCacheEngine-->>InputProcessor: 16. 返回 {<br/>sys_prompt: MISS,<br/>Doc1: HIT (cached_kv)<br/>}
+
+    InputProcessor->>GPUModelRunner: 17. get_or_compute_chunks(chunks)
+
+    GPUModelRunner->>GPUModelRunner: 18. compute_chunk_kv(<br/>tokens=sys_prompt,<br/>position=0)
+
+    Note over GPUModelRunner: 只计算未命中的sys_prompt
+    GPUModelRunner->>ChunkKVPool: 19. allocate(num_tokens)
+    GPUModelRunner->>GPUModelRunner: 20. 执行model.forward()
+    GPUModelRunner->>ChunkCacheEngine: 21. store(hash_xyz, chunk_kv)
+    ChunkCacheEngine->>ChunkStorageManager: 22. put(hash_xyz, chunk_kv)
+    ChunkCacheEngine-->>GPUModelRunner: 23. 存储成功
+
+    Note over GPUModelRunner: Doc1从缓存获取，跳过计算！
+    GPUModelRunner->>ChunkCacheEngine: 24. lookup(hash_def)
+    ChunkCacheEngine-->>GPUModelRunner: 25. 返回 cached_Doc1_kv
+
+    GPUModelRunner->>PositionRemapper: 26. remap(sys_prompt_kv, dst_position=0)
+
+    Note over PositionRemapper: 重映射sys_prompt
+    PositionRemapper->>ChunkKVPool: 27. allocate_main_kv(num_tokens)
+    ChunkKVPool-->>PositionRemapper: 28. 返回 [6000, 6001]
+    PositionRemapper->>PositionRemapper: 29. 拷贝 KV + 应用位置0的RoPE
+    PositionRemapper-->>GPUModelRunner: 30. 返回 RemappedChunkKV{<br/>block_ids: [6000, 6001],<br/>position: [0, 3)<br/>}
+
+    GPUModelRunner->>PositionRemapper: 31. remap(Doc1_kv, dst_position=3)
+
+    Note over PositionRemapper: 直接从缓存拷贝Doc1，无需计算！
+    PositionRemapper->>ChunkKVPool: 32. allocate_main_kv(num_tokens)
+    ChunkKVPool-->>PositionRemapper: 33. 返回 [6002, 6003, ...]
+
+    Note over PositionRemapper: 关键：跳过KV计算，直接拷贝+重映射
+    PositionRemapper->>PositionRemapper: 34. 拷贝 cached KV<br/>从缓存读取，无需计算
+    PositionRemapper->>PositionRemapper: 35. 应用位置3的RoPE<br/>覆盖虚拟位置编码
+
+    PositionRemapper-->>GPUModelRunner: 36. 返回 RemappedChunkKV{<br/>block_ids: [6002, 6003, ...],<br/>position: [3, 203)<br/>}
+
+    GPUModelRunner->>GPUModelRunner: 37. 计算question KV<br/>forward(question_tokens)
+
+    GPUModelRunner->>GPUModelRunner: 38. 拼接所有KV<br/>sys_prompt: [6000, 6001]<br/>Doc1: [6002, 6003, ...]<br/>question: [6100, 6101]<br/>→ merged_blocks
+
+    GPUModelRunner->>AttentionMaskBuilder: 39. get_chunk_aware_mask(<br/>chunk_boundaries,<br/>seq_len)
+
+    Note over AttentionMaskBuilder: 构建新的chunk隔离mask
+    AttentionMaskBuilder->>AttentionMaskBuilder: 40. chunk_ids分配<br/>sys_prompt: -1<br/>Doc1: 0<br/>question: -2
+    AttentionMaskBuilder->>AttentionMaskBuilder: 41. 应用chunk隔离规则<br/>Doc1不能看新sys_prompt的token
+    AttentionMaskBuilder-->>GPUModelRunner: 42. 返回 chunk_attn_mask
+
+    GPUModelRunner->>AscendSFABackend: 43. forward(<br/>query, key, value,<br/>chunk_attn_mask,<br/>merged_kv_blocks)
+
+    Note over AscendSFABackend: 执行推理
+    AscendSFABackend->>AscendSFABackend: 44. 应用chunk-aware mask
+    AscendSFABackend->>AscendSFABackend: 45. 执行注意力计算
+    AscendSFABackend-->>GPUModelRunner: 46. 返回 hidden_states
+
+    GPUModelRunner->>GPUModelRunner: 47. 生成output tokens
+    GPUModelRunner-->>LLMEngine: 48. 返回生成结果
+    LLMEngine-->>User: 49. 返回最终输出
+                    </div>
+                </div>
+
+                <div class="description">
+                    <h4>性能对比</h4>
+                    <table>
+                        <tr>
+                            <th>步骤</th>
+                            <th>缓存未命中</th>
+                            <th>缓存命中</th>
+                        </tr>
+                        <tr>
+                            <td>哈希查找</td>
+                            <td>MISS</td>
+                            <td>HIT</td>
+                        </tr>
+                        <tr>
+                            <td>KV计算</td>
+                            <td>✓ (50ms)</td>
+                            <td>✗ (跳过)</td>
+                        </tr>
+                        <tr>
+                            <td>缓存存储</td>
+                            <td>✓ (需要)</td>
+                            <td>✗ (跳过)</td>
+                        </tr>
+                        <tr>
+                            <td>KV拷贝</td>
+                            <td>✓ (3-5ms)</td>
+                            <td>✓ (3-5ms)</td>
+                        </tr>
+                        <tr>
+                            <td>RoPE处理</td>
+                            <td>虚拟→实际</td>
+                            <td>虚拟→实际</td>
+                        </tr>
+                        <tr>
+                            <td><strong>总时间</strong></td>
+                            <td>~55ms</td>
+                            <td>~5ms</td>
+                        </tr>
+                        <tr>
+                            <td><strong>加速比</strong></td>
+                            <td>1x</td>
+                            <td><strong>12x</strong></td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="performance">
+                    🎯 <strong>关键优化：</strong> Doc1 chunk从缓存直接获取，跳过50ms的KV计算，仅耗时5ms（拷贝+RoPE）
+                </div>
+            </div>
+
+            <!-- 流程3：位置编码处理 -->
+            <div id="flow3" class="section">
+                <h2>🎯 流程3：位置编码处理（关键流程）</h2>
+
+                <div class="description">
+                    <h4>为什么需要虚拟位置？</h4>
+                    <p>由于chunk需要在不同请求中复用，而不同请求中chunk的实际位置可能不同，因此：</p>
+                    <ul>
+                        <li><strong>计算时</strong>：所有chunk在同一虚拟位置`[0, max_chunk_len)`计算KV</li>
+                        <li><strong>使用时</strong>：通过PositionRemapper重映射到实际位置，重新应用RoPE编码</li>
+                    </ul>
+                </div>
+
+                <h3>时序图：PositionRemapper.remap() 核心流程</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Caller as 调用者<br/>(GPUModelRunner)
+    participant PositionRemapper as PositionRemapper<br/>(新增)
+    participant ChunkKVPool as ChunkKVPool<br/>(新增)
+    participant ChunkStorage as ChunkStorageManager<br/>(新增)
+    participant RoPEHelper as RoPEHelper<br/>(现有)
+    participant NPUOps as NPU Operations<br/>(硬件加速)
+
+    Caller->>PositionRemapper: 1. remap(<br/>src_kv: ChunkKV,<br/>dst_position: int)
+
+    Note over PositionRemapper: 输入：src_kv = {<br/>block_ids: [100, 101],<br/>virtual_position: [0, 3),<br/>key_cache, value_cache<br/>}<br/>dst_position = 3
+
+    PositionRemapper->>PositionRemapper: 2. 提取元数据<br/>num_tokens = src_kv.num_tokens<br/>virtual_pos = src_kv.virtual_position
+
+    PositionRemapper->>ChunkKVPool: 3. allocate_main_kv_pool(<br/>num_tokens,<br/>layer_idx,<br/>dtype)
+
+    Note over ChunkKVPool: 从主KV Pool分配块
+    ChunkKVPool->>ChunkKVPool: 4. 查找空闲块
+    ChunkKVPool-->>PositionRemapper: 5. 返回 dst_block_ids [5000, 5001]
+
+    PositionRemapper->>ChunkStorage: 6. get_chunk_kv(<br/>src_kv.block_ids)
+
+    Note over ChunkStorage: 从Chunk Pool读取KV数据
+    ChunkStorage->>ChunkStorage: 7. 读取key_cache[block_ids]
+    ChunkStorage->>ChunkStorage: 8. 读取value_cache[block_ids]
+    ChunkStorage-->>PositionRemapper: 9. 返回 {<br/>key: Tensor[3, num_heads, head_dim],<br/>value: Tensor[3, num_heads, head_dim]<br/>}
+
+    PositionRemapper->>PositionRemapper: 10. 准备实际位置<br/>actual_positions = torch.arange(<br/>dst_position,<br/>dst_position + num_tokens<br/>)<br/>→ [3, 4, 5]
+
+    Note over PositionRemapper: 关键：重新计算RoPE
+    PositionRemapper->>RoPEHelper: 11. compute_rope_params(<br/>actual_positions,<br/>head_dim)
+
+    RoPEHelper->>RoPEHelper: 12. 计算cos, sin<br/>基于actual_positions [3, 4, 5]
+    RoPEHelper-->>PositionRemapper: 13. 返回 {cos, sin}
+
+    PositionRemapper->>NPUOps: 14. npu_kv_copy_and_apply_rope(<br/>src_key: Tensor,<br/>src_value: Tensor,<br/>dst_block_ids: [5000, 5001],<br/>cos: Tensor,<br/>sin: Tensor)
+
+    Note over NPUOps: NPU加速：拷贝+RoPE一步完成
+    NPUOps->>NPUOps: 15. 拷贝KV数据到目标块<br/>key[100,101] → key[5000,5001]<br/>value[100,101] → value[5000,5001]
+
+    NPUOps->>NPUOps: 16. 应用RoPE编码<br/>for i in [3, 4, 5]:<br/>  key[i] = key[i] * cos[i] + rotate(key[i]) * sin[i]<br/>  value[i] = value[i] * cos[i] + rotate(value[i]) * sin[i]
+
+    Note over NPUOps: 覆盖虚拟位置的RoPE编码
+    NPUOps-->>PositionRemapper: 17. 拷贝+RoPE完成
+
+    PositionRemapper->>PositionRemapper: 18. 创建RemappedChunkKV{<br/>block_ids: [5000, 5001],<br/>position: range(3, 6),<br/>is_remapped: true<br/>}
+
+    PositionRemapper-->>Caller: 19. 返回 RemappedChunkKV
+
+    Note over Caller: 输出：重映射后的KV<br/>block_ids: [5000, 5001]<br/>position: [3, 4, 5]<br/>key/value: 已应用实际位置RoPE
+                    </div>
+                </div>
+
+                <h3>虚拟位置 vs 实际位置</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+graph TB
+    subgraph "虚拟位置计算（Chunk KV Cache）"
+        A1[sys_prompt: 0, 1, 2]
+        A2[chunk1: 0, 1, 2, ..., 199]
+        A3[chunk2: 0, 1, 2, ..., 199]
+        A4[chunk3: 0, 1, 2, ..., 199]
+    end
+
+    subgraph "重映射（PositionRemapper）"
+        B1[拷贝KV数据]
+        B2[应用实际位置RoPE]
+    end
+
+    subgraph "实际推理位置（用于Attention）"
+        C1[sys_prompt: 0, 1, 2]
+        C2[chunk1: 3, 4, 5, ..., 202]
+        C3[chunk2: 203, 204, ..., 402]
+        C4[chunk3: 403, 404, ..., 602]
+    end
+
+    A1 --> B1
+    A2 --> B1
+    A3 --> B1
+    A4 --> B1
+    B1 --> B2
+    B2 --> C1
+    B2 --> C2
+    B2 --> C3
+    B2 --> C4
+
+    style A1 fill:#e1f5ff
+    style A2 fill:#e1f5ff
+    style A3 fill:#e1f5ff
+    style A4 fill:#e1f5ff
+    style B1 fill:#fff3cd
+    style B2 fill:#fff3cd
+    style C1 fill:#d4edda
+    style C2 fill:#d4edda
+    style C3 fill:#d4edda
+    style C4 fill:#d4edda
+                    </div>
+                </div>
+
+                <div class="highlight">
+                    <strong>关键创新：</strong> 虚拟位置计算使得chunk可以在不同请求中复用，重映射时仅需拷贝KV数据+重新应用RoPE（约3-5ms），无需重新计算（约50ms）。
+                </div>
+            </div>
+
+            <!-- 流程4：Attention Mask构建 -->
+            <div id="flow4" class="section">
+                <h2>🎭 流程4：Chunk-Aware Attention Mask构建</h2>
+
+                <div class="description">
+                    <h4>为什么需要Chunk-Aware Attention Mask？</h4>
+                    <p>为了实现chunk间的隔离，需要自定义attention mask：</p>
+                    <ul>
+                        <li><strong>sys_prompt</strong>：标准causal attention</li>
+                        <li><strong>chunk token</strong>：可看sys_prompt + 同chunk内前序token</li>
+                        <li><strong>user_question</strong>：可看所有内容</li>
+                    </ul>
+                </div>
+
+                <h3>时序图</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+sequenceDiagram
+    autonumber
+    participant Caller as 调用者<br/>(GPUModelRunner)
+    participant MaskBuilder as AttentionMaskBuilder<br/>(新增)
+    participant ChunkParser as ChunkTokenParser<br/>(新增)
+
+    Caller->>MaskBuilder: 1. get_chunk_aware_mask(<br/>chunk_boundaries: [(0,3), (3,203), (203,205)],<br/>seq_len: 205)
+
+    Note over MaskBuilder: 输入：chunk边界定义<br/>- sys_prompt: [0, 3)<br/>- chunk1: [3, 203)<br/>- question: [203, 205)
+
+    MaskBuilder->>MaskBuilder: 2. 初始化chunk_id数组<br/>chunk_ids = torch.zeros(seq_len, dtype=int32)
+
+    MaskBuilder->>MaskParser: 3. parse_chunk_types(<br/>chunk_boundaries)
+
+    Note over MaskParser: 解析chunk类型
+    MaskParser->>MaskParser: 4. 遍历chunk_boundaries<br/>for start, end in boundaries:<br/>  if i == 0: type = SYS_PROMPT<br/>  elif i == len-1: type = QUESTION<br/>  else: type = CHUNK
+
+    MaskParser-->>MaskBuilder: 5. 返回 chunk_types<br/>[SYS_PROMPT, CHUNK, QUESTION]
+
+    loop 为每个token分配chunk_id
+        MaskBuilder->>MaskBuilder: 6. 分配chunk_id<br/>tokens [0,1,2] → chunk_id = -1 (sys_prompt)<br/>tokens [3..202] → chunk_id = 0 (chunk1)<br/>tokens [203..204] → chunk_id = -2 (question)
+    end
+
+    MaskBuilder->>MaskBuilder: 7. 初始化attention mask矩阵<br/>attn_mask = torch.zeros((seq_len, seq_len))
+
+    loop 构建attention mask
+        MaskBuilder->>MaskBuilder: 8. for i in range(seq_len):<br/>  for j in range(seq_len):<br/>    attn_mask[i,j] = compute_visibility(i, j, chunk_ids)
+
+        Note over MaskBuilder: 可见性规则<br/>if chunk_ids[i] == -1 (sys_prompt):<br/>  visible = (j <= i)  # 标准causal<br/>elif chunk_ids[i] == -2 (question):<br/>  visible = True  # 可看所有<br/>elif chunk_ids[i] == 0 (chunk):<br/>  visible = (chunk_ids[j] == -1) or (chunk_ids[j] == 0 and j <= i)  # sys_prompt + 同chunkcausal
+    end
+
+    MaskBuilder->>MaskBuilder: 9. 转换为二进制mask<br/>attn_mask = attn_mask.float()<br/>attn_mask[attn_mask == 0] = float('-inf')<br/>attn_mask[attn_mask == 1] = 0.0
+
+    MaskBuilder->>MaskBuilder: 10. 添加causal mask<br/>triangular = torch.tril(torch.ones(seq_len, seq_len))<br/>attn_mask = attn_mask + triangular
+
+    MaskBuilder-->>Caller: 11. 返回 attn_mask<br/>shape: (205, 205)
+
+    Note over Caller: 输出：chunk-aware attention mask<br/>- sys_prompt: 标准causal<br/>- chunk: 可看sys_prompt+同chunk<br/>- question: 可看所有
+                    </div>
+                </div>
+
+                <h3>Attention Mask矩阵示例（10x10）</h3>
+                <div class="diagram-container">
+                    <div class="mermaid">
+graph LR
+    subgraph "Attention Mask矩阵 (简化10x10)"
+        A["<table>
+            <tr>
+                <th></th>
+                <th>j=0</th>
+                <th>j=1</th>
+                <th>j=2</th>
+                <th>j=3</th>
+                <th>j=4</th>
+                <th>j=5</th>
+                <th>j=6</th>
+                <th>j=7</th>
+                <th>j=8</th>
+                <th>j=9</th>
+            </tr>
+            <tr>
+                <td><b>i=0</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=1</b></td>
+                <td>0</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=2</b></td>
+                <td>0</td><td>0</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=3</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td>
+            </tr>
+            <tr>
+                <td><b>i=4</b></td>
+                <td>1</td><td>1</td><td>1</td><td>0</td><td>1</td><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td>
+            </tr>
+            <tr>
+                <td><b>i=5</b></td>
+                <td>1</td><td>1</td><td>1</td><td>0</td><td>0</td><td>1</td><td>0</td><td>0</td><td>0</td><td>0</td>
+            </tr>
+            <tr>
+                <td><b>i=6</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=7</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>0</td><td>1</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=8</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>0</td><td>0</td><td>1</td><td>1</td>
+            </tr>
+            <tr>
+                <td><b>i=9</b></td>
+                <td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>1</td><td>0</td><td>0</td><td>0</td><td>1</td>
+            </tr>
+        </table>"]
+    end
+
+    style A fill:#f8f9fa
+                    </div>
+                </div>
+
+                <div class="description">
+                    <h4>示例说明</h4>
+                    <table>
+                        <tr>
+                            <th>Token类型</th>
+                            <th>范围</th>
+                            <th>可见性规则</th>
+                        </tr>
+                        <tr>
+                            <td><strong>sys_prompt</strong></td>
+                            <td>i=0, 1, 2</td>
+                            <td>标准causal attention（可看前面所有sys_prompt token）</td>
+                        </tr>
+                        <tr>
+                            <td><strong>chunk1</strong></td>
+                            <td>i=3, 4, 5</td>
+                            <td>可看sys_prompt (0,1,2) + 同chunk内causal</td>
+                        </tr>
+                        <tr>
+                            <td><strong>question</strong></td>
+                            <td>i=6, 7, 8, 9</td>
+                            <td>可看所有内容（sys_prompt + chunk1 + 前序question）</td>
+                        </tr>
+                    </table>
+                </div>
+
+                <div class="highlight">
+                    <strong>关键特性：</strong> chunk1 (i=3,4,5) 不能看question (i=6,7,8,9)，实现chunk间的正确隔离。
+                </div>
+            </div>
+
+            <!-- 涉及的类 -->
+            <div id="classes" class="section">
+                <h2>📦 涉及的类</h2>
+
+                <h3>新增的类（7个）</h3>
+
+                <div class="class-info">
+                    <h4>1. ChunkCacheEngine</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/core/chunk_cache_engine.py</code></p>
+                    <p><strong>职责：</strong> 协调层，提供统一的lookup/store/clear API</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def lookup(chunk_hash: bytes) -> ChunkKV | None
+def store(chunk_hash: bytes, chunk_kv: ChunkKV) -> None
+def clear() -> None
+def get_stats() -> Dict[str, Any]</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>2. ChunkTokenParser</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/core/chunk_token_parser.py</code></p>
+                    <p><strong>职责：</strong> 解析chunked prompt，识别chunk边界，计算内容哈希</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def parse(tokens: list[int], separator: str) -> ChunkedPrompt
+def compute_hash(tokens: list[int]) -> bytes  # XXHash128
+def validate(prompt_str: str) -> bool</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>3. ChunkStorageManager</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/core/chunk_storage_manager.py</code></p>
+                    <p><strong>职责：</strong> 管理chunk存储，分配/释放存储块</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def allocate(chunk_key: ChunkKey, kv_shape: tuple) -> list[int]
+def free(block_ids: list[int]) -> None
+def get(chunk_key: ChunkKey) -> ChunkKV | None
+def put(chunk_key: ChunkKey, chunk_kv: ChunkKV) -> None</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>4. ChunkHashIndex</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/core/chunk_hash_index.py</code></p>
+                    <p><strong>职责：</strong> 内容哈希→chunk映射索引，O(1)查找</p>
+                    <p><strong>数据结构：</strong></p>
+                    <pre><code>index: Dict[bytes, ChunkKV]  # content_hash -> ChunkKV</code></pre>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def lookup(chunk_hash: bytes) -> ChunkKV | None
+def insert(chunk_hash: bytes, chunk_kv: ChunkKV) -> None
+def remove(chunk_hash: bytes) -> None</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>5. ChunkKVConnector</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/core/chunk_kv_connector.py</code></p>
+                    <p><strong>职责：</strong> GPU↔CPU数据传输</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def to_cpu(gpu_kv: ChunkKV) -> MemoryObj
+def to_gpu(chunk_kv: ChunkKV) -> torch.Tensor</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>6. PositionRemapper</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/worker/position_remapper.py</code></p>
+                    <p><strong>职责：</strong> KV拷贝+RoPE重新编码（核心方法）</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def remap(src_kv: ChunkKV, dst_position: int) -> RemappedChunkKV
+def release(block_ids: list[int]) -> None</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>7. ChunkKVPool</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/worker/chunk_kv_pool.py</code></p>
+                    <p><strong>职责：</strong> 独立的显存池管理（默认2GB）</p>
+                    <p><strong>主要方法：</strong></p>
+                    <pre><code>def allocate(num_tokens: int) -> list[int]
+def allocate_main_kv(num_tokens: int) -> list[int]
+def free(block_ids: list[int]) -> None
+def get_stats() -> Dict[str, Any]</code></pre>
+                </div>
+
+                <h3>修改的类（6个）</h3>
+
+                <div class="class-info">
+                    <h4>1. InputProcessor</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/engine/input_processor.py</code></p>
+                    <p><strong>修改内容：</strong> 检测`# #`分隔符，解析chunked prompt</p>
+                    <p><strong>新增方法：</strong></p>
+                    <pre><code>def _detect_chunked_prompt(self, prompt_str: str) -> bool
+def parse_chunked_prompt(self, tokens: list[int]) -> ChunkedPrompt</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>2. GPUModelRunner</h4>
+                    <p><strong>路径：</strong> <code>vllm/v1/worker/gpu_model_runner.py</code></p>
+                    <p><strong>修改内容：</strong> 新增chunk处理方法</p>
+                    <p><strong>新增方法：</strong></p>
+                    <pre><code>def parse_chunked_prompt(self, request: Request) -> ChunkedPrompt
+def get_or_compute_chunks(self, chunked_prompt: ChunkedPrompt) -> list[RemappedChunkKV]
+def compute_chunk_kv(self, tokens: list[int], position: int) -> ChunkKV</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>3. AscendSFABackend</h4>
+                    <p><strong>路径：</strong> <code>vllm-ascend/attention/sfa_v1.py</code></p>
+                    <p><strong>修改内容：</strong> 集成chunk-aware attention mask</p>
+                    <p><strong>修改方法：</strong></p>
+                    <pre><code>def forward(self, query, key, value, chunk_attn_mask, kv_blocks):
+    # 应用chunk-aware attention mask
+    # 执行注意力计算</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>4. AttentionMaskBuilder</h4>
+                    <p><strong>路径：</strong> <code>vllm-ascend/attention/attention_mask.py</code></p>
+                    <p><strong>修改内容：</strong> 新增chunk-aware attention mask生成</p>
+                    <p><strong>新增方法：</strong></p>
+                    <pre><code>@staticmethod
+def get_chunk_aware_mask(
+    chunk_boundaries: list[tuple[int, int]],
+    seq_len: int
+) -> torch.Tensor:
+    """构建chunk隔离attention mask"""</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>5. VllmConfig</h4>
+                    <p><strong>路径：</strong> <code>vllm/config/vllm_config.py</code></p>
+                    <p><strong>修改内容：</strong> 添加ChunkCacheConfig配置类</p>
+                    <pre><code>@dataclass
+class ChunkCacheConfig:
+    enable_chunk_cache: bool = False
+    chunk_separator: str = " # # "
+    chunk_cache_gpu_memory_fraction: float = 0.15
+    chunk_hash_algorithm: str = "xxhash"</code></pre>
+                </div>
+
+                <div class="class-info">
+                    <h4>6. AscendStoreConnector</h4>
+                    <p><strong>路径：</strong> <code>vllm-ascend/distributed/kvpool/ascend_store_connector.py</code></p>
+                    <p><strong>修改内容：</strong> 扩展支持chunk KV传输</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>位置无关Chunk缓存设计方案 - 流程时序图</p>
+            <p>Generated with Claude Code - Mermaid.js</p>
+        </div>
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'default',
+            sequence: {
+                diagramMarginX: 50,
+                diagramMarginY: 10,
+                actorMargin: 50,
+                width: 150,
+                height: 65,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35,
+                mirrorActors: true,
+                useMaxWidth: true
+            },
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true,
+                curve: 'basis'
+            }
+        });
+    </script>
+</body>
+</html>
