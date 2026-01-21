@@ -1,0 +1,24 @@
+Prefix Caching特性使用的是严格的位置匹配. 我想做一种位置无关的KVCache缓存和复用的功能
+
+1. Prompt 通过 " # # "分成不同的块, 形式如
+sys_prompt + " # # " + chunk1 + " # # " + chunk2 + " # # " + chunk3 + " # # " user question
+2. 这里的chunk1, chunk2, chunk3 都单独和sys_prompt构建KVCache, 各个chunk之间没有交叉注意力
+sys_prompt + chunk1
+sys_prompt + chunk2
+sys_prompt + chunk3
+user question 和所有的内容做交叉注意力
+2.1 预处理过程中,对分割符进行解析和处理
+3. chunk 的 KVCache是按照Token粒度来缓存的, 缓存到显存中. 这块显存需要单独管理, 大小可以配置,默认2G
+4. 位置编码的处理
+chunk1, chunk2, chunk3 的位置编码有重叠, user question 从所有chunk中最大的位置开始位置编码
+5. 新来的请求, 按照chunk进行缓存匹配, 忽略位置信息, 匹配的chunk,将KVCache copy 到 vllm Paged attention 的KVCache中,拼接在一起,进行推理.
+6. 如果prompt中含有 # # 则按照chunck进行缓存和匹配, 不再使用prefix caching进行缓存匹配.
+7. 我想在昇腾上做这个能力, 基于 vllm + vllm-ascend
+请帮我做一个方案设计
+
+我的初步想法是
+1. 在InputPreprocessor增加分割符解析和处理的能力, 将Prompt按照分割后的chunk进行tokenize, 并增强原来的EngineCoreRequest等类,来保存Chunk相关信息
+2. 增加新的ChunkCacheManager, ChunkCachePool来管理 Chunk Cache, 包括设置缓存大小,分配Chunk Cache, 查找Chunk Cache等
+3. 改造Schedulor, 如果有Chunk信息的Request, 不走Prefix Caching逻辑, 走新的Chunk Prefix Caching逻辑
+4. 分配的Chunk Cache信息,发送给ModelRunner 再进一步传递给 Attention backend, 将KV存入 Chunk Cache, 或者将ChunkCache 搬入 KVCache(Paged Attention)
+5. 在Attention backend 进行位置编码校正
