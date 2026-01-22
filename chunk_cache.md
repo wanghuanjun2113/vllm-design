@@ -59,6 +59,7 @@ Chunk Cache 是一种位置无关的 KV Cache 缓存和复用机制,旨在扩展
                     │  └─────────────────────────┘   │
                     │  ┌─────────────────────────┐   │
                     │  │    Tokenizer            │   │
+                    │  │  - Tokenize system      │   │
                     │  │  - Tokenize chunks      │   │
                     │  │  - Compute hashes       │   │
                     │  └─────────────────────────┘   │
@@ -70,9 +71,14 @@ Chunk Cache 是一种位置无关的 KV Cache 缓存和复用机制,旨在扩展
                     │  - request_id                   │
                     │  - prompt_token_ids             │
                     │  - chunk_metadata (NEW)         │
-                    │    ├─ chunk_token_ids[]         │
-                    │    ├─ chunk_hashes[]            │
-                    │    └─ chunk_dependencies[]     │
+                    │    ├─ system_metadata          │   │
+                    │    │   └─ [0, len(sys))        │   │
+                    │    ├─ chunk1_metadata          │   │
+                    │    │   └─ [len(sys), ...)      │   │
+                    │    ├─ chunk2_metadata          │   │
+                    │    │   └─ [len(sys), ...)      │   │
+                    │    └─ chunk_hashes[]           │   │
+                    │  - user_question_start         │   │
                     └──────────────┬──────────────────┘
                                    │
                         ┌──────────┴──────────┐
@@ -96,6 +102,8 @@ Chunk Cache 是一种位置无关的 KV Cache 缓存和复用机制,旨在扩展
     │  ┌───────────────────────────────┐  │
     │  │   Chunk Cache Pool            │  │
     │  │  - Token-granular storage     │  │
+    │  │  - System Prompt Cache        │  │
+    │  │  - Chunk Cache Separation     │  │
     │  │  - LRU eviction               │  │
     │  │  - Hash-based lookup          │  │
     │  │  - Configurable size (2GB)    │  │
@@ -128,8 +136,9 @@ Chunk Cache 是一种位置无关的 KV Cache 缓存和复用机制,旨在扩展
     │   Attention Backend (Ascend)        │
     │  ┌───────────────────────────────┐  │
     │  │   Position Encoding Handler   │  │
-    │  │  - Correct chunk positions    │  │
-    │  │  - Handle overlapping offsets │  │
+    │  │  - Separate sys & chunk pos   │  │
+    │  │  - Apply RoPE correction      │  │
+    │  │  - Handle position reuse      │  │
     │  │  - Compute sin/cos for reuse  │  │
     │  └───────────────────────────────┘  │
     │  ┌───────────────────────────────┐  │
@@ -184,24 +193,44 @@ class ChunkParseResult:
 
 **主要功能**:
 - 存储 Chunk 的 Token 信息
-- 管理 Chunk 的内容哈希
+- 管理 Chunk 的内容哈希（位置无关）
 - 跟踪 Chunk 之间的依赖关系
+- 区分 System Prompt 和普通 Chunk
 - 提供 Chunk 匹配所需的所有元数据
 
 **对外接口**:
 ```python
 @dataclass
 class ChunkMetadata:
-    chunk_id: str                    # Chunk 唯一标识
-    token_ids: List[int]             # Chunk 的 Token IDs
-    chunk_hash: str                  # 内容哈希(位置无关)
-    position_offset: int             # 位置偏移量
-    dependencies: List[str]          # 依赖的其他 Chunk IDs
+    chunk_id: str                          # Chunk 唯一标识
+    token_ids: List[int]                   # Chunk 的 Token IDs
+    chunk_hash: str                        # 内容哈希(位置无关)
+    position_offset: int                   # 位置偏移量
+    dependencies: List[str]                # 依赖的其他 Chunk IDs
     kv_cache_blocks: Optional[KVCacheBlocks]  # 缓存的 KV Cache
+
+    # 新增：System Prompt 分离支持
+    is_system_prompt: bool = False         # 标识是否为 System Prompt
+    parent_chunk_id: Optional[str] = None  # 如果 chunk 依赖 sys，存储 sys 的 ID
+    base_position: int = 0                 # 缓存时的基准位置
+
+    @property
+    def content_hash(self) -> str:
+        """位置无关的 hash（用于匹配）"""
+        return self.chunk_hash
+
+    @property
+    def full_hash(self) -> str:
+        """包含位置的 hash（用于完整性验证）"""
+        import hashlib
+        data = bytes([(i, tid) for i, tid in enumerate(self.token_ids)])
+        return hashlib.sha256(data).hexdigest()
 
     def compute_hash(self) -> str:
         """计算位置无关的内容哈希"""
-        pass
+        import hashlib
+        data = bytes(self.token_ids)
+        return hashlib.sha256(data).hexdigest()
 ```
 
 #### 3. Chunk Cache Pool (新增)
@@ -209,37 +238,115 @@ class ChunkMetadata:
 **位置**: `vllm_ascend/chunk/cache_pool.py`
 
 **主要功能**:
-- 管理 Token 粒度的 KV Cache 存储
+- 管理 Token 粒度的 KV Cache 存储（使用混合粒度方案）
 - 实现 LRU 缓存淘汰策略
 - 提供基于哈希的快速查找
 - 支持可配置的显存大小(默认 2GB)
+- 支持 System Prompt 和 Chunk 的分离存储
+- 提供位置校正接口
 
 **对外接口**:
 ```python
 class ChunkCachePool:
-    def __init__(self, cache_size_gb: float = 2.0):
-        """初始化 Chunk Cache Pool"""
-        pass
+    def __init__(self, cache_size_gb: float = 2.0, block_size: int = 16):
+        """初始化 Chunk Cache Pool
+
+        Args:
+            cache_size_gb: 缓存池大小(GB)
+            block_size: Block 大小(tokens)，默认 16
+        """
+        self.block_size = block_size
+        self.block_pool = BlockPool(size_gb=cache_size_gb)
+        self.chunk_map: Dict[str, ChunkCacheEntry] = {}
 
     def get_chunk_cache(self, chunk_hash: str) -> Optional[ChunkKVCache]:
         """根据哈希查找已缓存的 Chunk KV Cache"""
-        pass
+        entry = self.chunk_map.get(chunk_hash)
+        if entry:
+            # 更新 LRU
+            self.block_pool.touch(entry.block_ids)
+            return entry.kv_cache
+        return None
 
-    def store_chunk_cache(self, chunk_hash: str, kv_cache: ChunkKVCache) -> None:
-        """存储 Chunk KV Cache 到池中"""
-        pass
+    def store_chunk_cache(
+        self,
+        chunk_hash: str,
+        kv_cache: ChunkKVCache,
+        is_system_prompt: bool = False
+    ) -> None:
+        """存储 Chunk KV Cache 到池中
 
-    def allocate_chunk_cache(self, num_tokens: int) -> ChunkKVCache:
+        Args:
+            chunk_hash: Chunk 的内容哈希
+            kv_cache: 要缓存的数据
+            is_system_prompt: 是否为 System Prompt
+        """
+        num_tokens = kv_cache.num_tokens
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+
+        # 分配 blocks
+        block_ids = self.block_pool.allocate(num_blocks)
+
+        # 拷贝 KV 数据到 blocks
+        self._copy_kv_to_blocks(kv_cache, block_ids)
+
+        # 存储映射
+        self.chunk_map[chunk_hash] = ChunkCacheEntry(
+            block_ids=block_ids,
+            num_tokens=num_tokens,
+            is_system_prompt=is_system_prompt,
+            base_position=kv_cache.base_position,
+            kv_cache=kv_cache
+        )
+
+    def allocate_chunk_cache(
+        self,
+        num_tokens: int,
+        is_system_prompt: bool = False
+    ) -> ChunkKVCache:
         """为 Chunk 分配 KV Cache 空间"""
-        pass
+        num_blocks = (num_tokens + self.block_size - 1) // self.block_size
+        block_ids = self.block_pool.allocate(num_blocks)
+
+        return ChunkKVCache(
+            block_ids=block_ids,
+            num_tokens=num_tokens,
+            is_system_prompt=is_system_prompt,
+            base_position=0
+        )
 
     def evict_lru(self) -> None:
         """淘汰最久未使用的 Chunk Cache"""
-        pass
+        # 从 block_pool 获取 LRU entry
+        lru_entry = self.block_pool.get_lru()
+
+        # 释放对应的 chunk
+        for hash, entry in self.chunk_map.items():
+            if entry.block_ids[0] == lru_entry.block_id:
+                del self.chunk_map[hash]
+                break
 
     def get_stats(self) -> CacheStats:
         """获取缓存统计信息"""
-        pass
+        return CacheStats(
+            total_chunks=len(self.chunk_map),
+            total_tokens=sum(e.num_tokens for e in self.chunk_map.values()),
+            hit_rate=self.block_pool.get_hit_rate(),
+            usage_ratio=self.block_pool.get_usage()
+        )
+
+@dataclass
+class ChunkCacheEntry:
+    """Chunk 缓存条目"""
+    block_ids: List[int]           # 占用的 block IDs
+    num_tokens: int                # Token 数量
+    is_system_prompt: bool         # 是否为 System Prompt
+    base_position: int             # 缓存时的基准位置
+    kv_cache: ChunkKVCache         # KV Cache 数据
+
+    @property
+    def num_blocks(self) -> int:
+        return len(self.block_ids)
 ```
 
 #### 4. Chunk Cache Manager (新增)
@@ -251,17 +358,76 @@ class ChunkCachePool:
 - 处理 Chunk 匹配和 KV Cache 组装
 - 管理未命中 Chunk 的计算
 - 与 Scheduler 协作进行缓存调度
+- 实现 System Prompt 和 Chunk 的分离管理
+- 提供位置校正功能
 
 **对外接口**:
 ```python
 class ChunkCacheManager:
-    def __init__(self, cache_pool: ChunkCachePool):
-        """初始化 Chunk Cache Manager"""
-        pass
+    def __init__(self, cache_pool: ChunkCachePool, system_len: int = 0):
+        """初始化 Chunk Cache Manager
 
-    def match_chunks(self, request: Request) -> ChunkMatchResult:
-        """匹配请求中的所有 Chunks,返回命中结果"""
-        pass
+        Args:
+            cache_pool: Chunk 缓存池
+            system_len: System Prompt 的 token 长度
+        """
+        self.cache_pool = cache_pool
+        self.system_len = system_len
+        self.system_hash: Optional[str] = None
+
+    def set_system_prompt(self, system_tokens: List[int]) -> str:
+        """设置 System Prompt
+
+        Args:
+            system_tokens: System prompt 的 token IDs
+
+        Returns:
+            System prompt 的 hash
+        """
+        system_hash = compute_chunk_hash(system_tokens)
+        self.system_hash = system_hash
+        self.system_len = len(system_tokens)
+        return system_hash
+
+    def match_chunks(
+        self,
+        request: Request,
+        system_hash: str
+    ) -> ChunkMatchResult:
+        """匹配请求中的所有 Chunks,返回命中结果
+
+        Args:
+            request: 包含 chunk_metadata 的请求
+            system_hash: System prompt 的 hash
+
+        Returns:
+            ChunkMatchResult: 匹配结果
+        """
+        matched = {}
+        missing = []
+
+        # 匹配 System Prompt
+        sys_cache = self.cache_pool.get_chunk_cache(system_hash)
+        if sys_cache:
+            matched[-1] = sys_cache  # 使用 -1 表示 system prompt
+        else:
+            missing.append(-1)  # -1 表示 system prompt 缺失
+
+        # 匹配各个 Chunks
+        for idx, chunk_meta in enumerate(request.chunk_metadata):
+            chunk_cache = self.cache_pool.get_chunk_cache(chunk_meta.chunk_hash)
+            if chunk_cache:
+                matched[idx] = chunk_cache
+            else:
+                missing.append(idx)
+
+        hit_ratio = len(matched) / (len(request.chunk_metadata) + 1)
+
+        return ChunkMatchResult(
+            matched_chunks=matched,
+            missing_chunks=missing,
+            hit_ratio=hit_ratio
+        )
 
     def compute_missing_chunks(
         self,
@@ -269,21 +435,115 @@ class ChunkCacheManager:
         match_result: ChunkMatchResult
     ) -> None:
         """计算未命中的 Chunks 并存储到 Cache Pool"""
-        pass
+        for idx in match_result.missing_chunks:
+            if idx == -1:  # System Prompt
+                self._compute_system_prompt(request)
+            else:  # Chunk
+                self._compute_chunk(request, idx)
 
     def assemble_kv_cache(
         self,
         request: Request,
-        match_result: ChunkMatchResult
-    ) -> KVCacheBlocks:
-        """组装完整的 KV Cache(复用 + 新计算)"""
-        pass
+        match_result: ChunkMatchResult,
+        target_device: torch.device
+    ) -> Tuple[KVCacheBlocks, List[int]]:
+        """组装完整的 KV Cache(复用 + 新计算)
+
+        Args:
+            request: 请求对象
+            match_result: 匹配结果
+            target_device: 目标设备
+
+        Returns:
+            (KVCacheBlocks, position_offsets): 组装后的 KV Cache 和位置偏移
+        """
+        assembled_blocks = []
+        position_offsets = []
+
+        # 1. 添加 System Prompt（如果有）
+        if -1 in match_result.matched_chunks:
+            sys_kv = match_result.matched_chunks[-1]
+            assembled_blocks.append(sys_kv.kv_cache_blocks)
+            position_offsets.append(0)  # System Prompt 从 0 开始
+
+        # 2. 添加各个 Chunks（带位置校正）
+        for idx, chunk_meta in enumerate(request.chunk_metadata):
+            if idx in match_result.matched_chunks:
+                chunk_kv = match_result.matched_chunks[idx]
+
+                # 计算目标位置：从 sys_len 开始
+                target_position = self.system_len
+
+                # 如果目标位置与缓存时的位置不同，需要校正
+                if chunk_kv.base_position != target_position:
+                    chunk_kv = self._apply_position_correction(
+                        chunk_kv,
+                        target_position,
+                        target_device
+                    )
+
+                assembled_blocks.append(chunk_kv.kv_cache_blocks)
+                position_offsets.append(target_position)
+
+        # 合并所有 blocks
+        final_kv_blocks = self._merge_blocks(assembled_blocks)
+
+        return final_kv_blocks, position_offsets
+
+    def _apply_position_correction(
+        self,
+        chunk_kv: ChunkKVCache,
+        target_position: int,
+        device: torch.device
+    ) -> ChunkKVCache:
+        """应用位置编码校正
+
+        方案 A: 存储原始 KV，使用时重新应用 RoPE
+
+        Args:
+            chunk_kv: 缓存的 Chunk KV
+            target_position: 目标位置
+            device: 设备
+
+        Returns:
+            校正后的 Chunk KV
+        """
+        # 获取目标位置的 RoPE cos/sin
+        cos, sin = get_rope_for_position(
+            start=target_position,
+            length=chunk_kv.num_tokens,
+            device=device
+        )
+
+        # 应用新的 RoPE 到原始 K
+        K_corrected = apply_rope(
+            chunk_kv.key_cache_raw,  # 使用原始的、未应用 RoPE 的 K
+            cos,
+            sin
+        )
+
+        # 创建新的 ChunkKVCache
+        return ChunkKVCache(
+            key_cache=K_corrected,
+            value_cache=chunk_kv.value_cache,  # V 不需要处理
+            base_position=target_position,
+            num_tokens=chunk_kv.num_tokens
+        )
 
 @dataclass
 class ChunkMatchResult:
-    matched_chunks: Dict[int, ChunkKVCache]   # 命中的 Chunks (chunk_index → kv_cache)
-    missing_chunks: List[int]                  # 未命中的 Chunk 索引
-    hit_ratio: float                           # 命中率
+    """Chunk 匹配结果"""
+    matched_chunks: Dict[int, ChunkKVCache]  # 命中的 Chunks (索引 → kv_cache)
+    missing_chunks: List[int]                 # 未命中的 Chunk 索引（-1 表示 system）
+    hit_ratio: float                          # 命中率
+
+    def get_hit_count(self) -> int:
+        """获取命中的 Chunk 数量"""
+        return len(self.matched_chunks)
+
+    def get_miss_count(self) -> int:
+        """获取未命中的 Chunk 数量"""
+        return len(self.missing_chunks)
 ```
 
 #### 5. Input Preprocessor Enhancement (修改)
@@ -292,9 +552,10 @@ class ChunkMatchResult:
 
 **修改内容**:
 - 集成 ChunkParser 进行 Chunk 解析
-- 对每个 Chunk 单独进行 Tokenization
-- 计算 Chunk 的内容哈希
-- 增强 EngineCoreRequest 添加 Chunk 元数据
+- 对 System Prompt 单独进行 Tokenization 和元数据创建
+- 对每个 Chunk 单独进行 Tokenization（只包含 chunk 部分）
+- 计算 Chunk 的内容哈希（位置无关）
+- 修正 `prompt_token_ids` 包含完整序列
 
 **修改点**:
 ```python
@@ -311,31 +572,85 @@ class InputPreprocessor:
 
         return result
 
-    def _process_chunked_prompt(self, prompt: str, ...):
-        """处理包含 Chunks 的 Prompt"""
+    def _process_chunked_prompt(
+        self,
+        prompt: str,
+        request_id: str,
+        ...
+    ) -> EngineCoreRequest:
+        """处理包含 Chunks 的 Prompt
+
+        关键修改：
+        1. System Prompt 单独 tokenize 和创建 metadata
+        2. Chunk 只包含自己的部分（不含 sys）
+        3. prompt_token_ids 包含完整序列
+        """
+        from vllm.v1.engine.chunk_metadata import ChunkMetadata
+
+        # 1. 解析 chunks
         parse_result = self.chunk_parser.parse(prompt)
 
-        # Tokenize system prompt
+        # 2. Tokenize system prompt（单独）
         system_tokens = self._tokenize_prompt(parse_result.system_prompt)
+        system_meta = ChunkMetadata(
+            chunk_id=f"{request_id}_system",
+            token_ids=system_tokens,
+            chunk_hash=compute_chunk_hash(system_tokens),
+            position_offset=0,
+            dependencies=[],
+            is_system_prompt=True,  # 标记为 system prompt
+            base_position=0,
+            kv_cache_blocks=None
+        )
 
-        # Tokenize each chunk independently
-        chunk_metadata_list = []
-        for chunk_text in parse_result.chunks:
-            # Chunk 与 system prompt 结合 tokenize
-            combined = system_tokens + self._tokenize_prompt(chunk_text)
+        # 3. Tokenize each chunk（只包含 chunk 部分）
+        chunk_metadata_list = [system_meta]  # system metadata 放在第一个
+
+        for chunk_idx, chunk_text in enumerate(parse_result.chunks):
+            # 只 tokenize chunk 本身，不包含 system
+            chunk_only_tokens = self._tokenize_prompt(chunk_text)
+
             chunk_meta = ChunkMetadata(
-                token_ids=combined,
-                chunk_hash=compute_hash(combined),
-                ...
+                chunk_id=f"{request_id}_chunk_{chunk_idx}",
+                token_ids=chunk_only_tokens,  # 只包含 chunk 部分
+                chunk_hash=compute_chunk_hash(chunk_only_tokens),  # 位置无关的 hash
+                position_offset=len(system_tokens),  # chunk 从 sys 后开始
+                dependencies=[system_meta.chunk_id],  # 依赖 system prompt
+                is_system_prompt=False,
+                parent_chunk_id=system_meta.chunk_id,
+                base_position=len(system_tokens),  # 缓存时的基准位置
+                kv_cache_blocks=None
             )
             chunk_metadata_list.append(chunk_meta)
 
-        # Tokenize user question
+        # 4. Tokenize user question
         user_tokens = self._tokenize_prompt(parse_result.user_question)
 
+        # 5. 计算 user question 的位置：len(sys) + max(all_chunks)
+        max_chunk_len = max(
+            len(meta.token_ids) for meta in chunk_metadata_list
+            if not meta.is_system_prompt
+        ) if chunk_metadata_list else 0
+        user_start = len(system_tokens) + max_chunk_len
+
+        # 6. 构建 prompt_token_ids（完整序列）
+        # 注意：这里我们按顺序拼接，但实际使用时会通过 chunk_metadata 来处理
+        all_chunk_tokens = []
+        for meta in chunk_metadata_list:
+            if not meta.is_system_prompt:
+                all_chunk_tokens.extend(meta.token_ids)
+
+        prompt_token_ids = (
+            system_tokens +
+            all_chunk_tokens +
+            user_tokens
+        )
+
         return EngineCoreRequest(
-            prompt_token_ids=system_tokens + user_tokens,
-            chunk_metadata=chunk_metadata_list,  # 新增字段
+            prompt_token_ids=prompt_token_ids,
+            chunk_metadata=chunk_metadata_list,
+            has_chunks=True,
+            user_question_start=user_start,
             ...
         )
 ```
@@ -345,8 +660,10 @@ class InputPreprocessor:
 **位置**: `vllm/v1/engine/__init__.py`
 
 **修改内容**:
-- 添加 `chunk_metadata` 字段存储 Chunk 信息
+- 添加 `chunk_metadata` 字段存储 Chunk 信息（包含 system prompt）
 - 添加 `has_chunks` 标识是否使用 Chunk Cache
+- 添加 `user_question_start` 字段存储 user question 的起始位置
+- 添加 `system_prompt_hash` 字段用于快速匹配 system prompt
 
 **修改点**:
 ```python
@@ -361,12 +678,35 @@ class EngineCoreRequest:
     # 新增字段
     chunk_metadata: List[ChunkMetadata] | None = field(default=None)
     has_chunks: bool = field(default=False)
+    user_question_start: int = field(default=0)  # user question 的起始位置
+    system_prompt_hash: str | None = field(default=None)  # system prompt 的 hash
 
     def get_chunk_hashes(self) -> List[str]:
-        """获取所有 Chunk 的哈希值"""
+        """获取所有 Chunk 的哈希值（不包括 system prompt）"""
         if not self.chunk_metadata:
             return []
-        return [meta.chunk_hash for meta in self.chunk_metadata]
+        return [
+            meta.chunk_hash for meta in self.chunk_metadata
+            if not meta.is_system_prompt
+        ]
+
+    def get_system_hash(self) -> str | None:
+        """获取 System Prompt 的 hash"""
+        if not self.chunk_metadata:
+            return None
+        for meta in self.chunk_metadata:
+            if meta.is_system_prompt:
+                return meta.chunk_hash
+        return None
+
+    def get_system_prompt_tokens(self) -> List[int]:
+        """获取 System Prompt 的 token IDs"""
+        if not self.chunk_metadata:
+            return []
+        for meta in self.chunk_metadata:
+            if meta.is_system_prompt:
+                return meta.token_ids
+        return []
 ```
 
 #### 7. Scheduler Enhancement (修改)
@@ -551,29 +891,42 @@ Request Input
 │ Step 4: Position Encoding Correction                                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  ┌────────────────────────────────────────────────────────────────────┐     │
-│  │  Compute Position Offsets                                           │     │
-│  │    ├─ chunk1_end = len(chunk1_tokens)                              │     │
-│  │    ├─ chunk2_end = chunk1_end + len(chunk2_tokens)                 │     │
-│  │    ├─ chunk3_end = chunk2_end + len(chunk3_tokens)                 │     │
-│  │    └─ user_start = max(chunk1_end, chunk2_end, chunk3_end)         │     │
+│  │  Compute Position Offsets (根据用户需求更新)                        │     │
+│  │    ├─ system_prompt: [0, len(sys))                                │     │
+│  │    ├─ chunk1: [len(sys), len(sys) + len(chunk1))                  │     │
+│  │    ├─ chunk2: [len(sys), len(sys) + len(chunk2))                  │     │
+│  │    ├─ chunk3: [len(sys), len(sys) + len(chunk3))                  │     │
+│  │    └─ user_start = len(sys) + max(len(chunk1), len(chunk2), ...)  │     │
+│  │                                                                    │     │
+│  │  示例 (sys=100, chunk1=200, chunk2=150, chunk3=180):              │     │
+│  │    ├─ system:  [0, 100)                                           │     │
+│  │    ├─ chunk1:  [100, 300)                                         │     │
+│  │    ├─ chunk2:  [100, 250)  (与 chunk1 重叠)                       │     │
+│  │    ├─ chunk3:  [100, 280)  (与 chunk1,2 重叠)                     │     │
+│  │    └─ user:    [300, ...)  (从 100 + max(200,150,180) = 300)      │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 │                                │                                             │
 │                                ▼                                             │
 │  ┌────────────────────────────────────────────────────────────────────┐     │
-│  │  Correct Position Encoding for Chunks                              │     │
-│  │    ├─ chunk1: positions [0, chunk1_end)                            │     │
-│  │    ├─ chunk2: positions [0, chunk2_end)  (overlaps with chunk1)    │     │
-│  │    ├─ chunk3: positions [0, chunk3_end)  (overlaps with chunk1,2)  │     │
-│  │    └─ user: positions [user_start, ...)                            │     │
+│  │  Apply Position Correction for Cached Chunks                      │     │
+│  │    ├─ For each matched chunk:                                      │     │
+│  │    │   ├─ Get target_position = len(sys)                           │     │
+│  │    │   ├─ If cached_base_position != target_position:             │     │
+│  │    │   │   └─ Apply position correction                            │     │
+│  │    │   │       ├─ Get cos/sin for target_position                  │     │
+│  │    │   │       ├─ Re-apply RoPE to original K                       │     │
+│  │    │   │       └─ V remains unchanged                              │     │
+│  │    │   └─ Add to assembly list                                     │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 │                                │                                             │
 │                                ▼                                             │
 │  ┌────────────────────────────────────────────────────────────────────┐     │
-│  │  Recompute RoPE cos/sin for each chunk                             │     │
-│  │    ├─ cos_chunk1, sin_chunk1 = rope(positions[0:chunk1_end])       │     │
-│  │    ├─ cos_chunk2, sin_chunk2 = rope(positions[0:chunk2_end])       │     │
-│  │    ├─ cos_chunk3, sin_chunk3 = rope(positions[0:chunk3_end])       │     │
-│  │    └─ cos_user, sin_user = rope(positions[user_start:])            │     │
+│  │  Assemble Full Sequence with Corrected Positions                  │     │
+│  │    ├─ System Prompt KV: positions [0, len(sys))                    │     │
+│  │    ├─ Chunk 1 KV: positions [len(sys), ...) (corrected)           │     │
+│  │    ├─ Chunk 2 KV: positions [len(sys), ...) (corrected)           │     │
+│  │    ├─ Chunk 3 KV: positions [len(sys), ...) (corrected)           │     │
+│  │    └─ User question: positions [user_start, ...)                  │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────────────────────────────────┘
    │
